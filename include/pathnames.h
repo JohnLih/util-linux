@@ -35,7 +35,6 @@
 # define _PATH_DEFPATH_ROOT	"/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin"
 #endif
 
-#define _PATH_SECURETTY		"/etc/securetty"
 #define _PATH_WTMPLOCK		"/etc/wtmplock"
 
 #define	_PATH_HUSHLOGIN		".hushlogin"
@@ -47,19 +46,15 @@
 #define	_PATH_MAILDIR		"/var/spool/mail"
 #endif
 #define	_PATH_MOTDFILE		"/etc/motd"
+#ifndef _PATH_NOLOGIN
 #define	_PATH_NOLOGIN		"/etc/nologin"
+#endif
 #define	_PATH_VAR_NOLOGIN	"/var/run/nologin"
 
+#ifndef _PATH_LOGIN
 #define _PATH_LOGIN		"/bin/login"
-#define _PATH_INITTAB		"/etc/inittab"
-#define _PATH_RC		"/etc/rc"
-#define _PATH_REBOOT		"/sbin/reboot"
+#endif
 #define _PATH_SHUTDOWN		"/sbin/shutdown"
-#define _PATH_SINGLE		"/etc/singleboot"
-#define _PATH_SHUTDOWN_CONF	"/etc/shutdown.conf"
-
-#define _PATH_SECURE		"/etc/securesingle"
-#define _PATH_USERTTY           "/etc/usertty"
 
 #define _PATH_TERMCOLORS_DIRNAME "terminal-colors.d"
 #define _PATH_TERMCOLORS_DIR	"/etc/" _PATH_TERMCOLORS_DIRNAME
@@ -91,8 +86,6 @@
 #define _PATH_WORDS_ALT         "/usr/share/dict/web2"
 
 /* mount paths */
-#define _PATH_UMOUNT		"/bin/umount"
-
 #define _PATH_FILESYSTEMS	"/etc/filesystems"
 #define _PATH_PROC_SWAPS	"/proc/swaps"
 #define _PATH_PROC_FILESYSTEMS	"/proc/filesystems"
@@ -136,11 +129,6 @@
 # endif
 #endif
 
-#define _PATH_MNTTAB_DIR	_PATH_MNTTAB ".d"
-
-#define _PATH_MOUNTED_LOCK	_PATH_MOUNTED "~"
-#define _PATH_MOUNTED_TMP	_PATH_MOUNTED ".tmp"
-
 #ifndef _PATH_DEV
   /*
    * The tailing '/' in _PATH_DEV is there for compatibility with libc.
@@ -152,8 +140,6 @@
 
 #define _PATH_DEV_LOOP		"/dev/loop"
 #define _PATH_DEV_LOOPCTL	"/dev/loop-control"
-#define _PATH_DEV_TTY		"/dev/tty"
-
 
 /* udev paths */
 #define _PATH_DEV_BYLABEL	"/dev/disk/by-label"
@@ -207,6 +193,9 @@
 
 /* logger paths */
 #define _PATH_DEVLOG		"/dev/log"
+
+/* ctrlaltdel paths */
+#define _PATH_PROC_CTRL_ALT_DEL	"/proc/sys/kernel/ctrl-alt-del"
 
 #endif /* PATHNAMES_H */
 

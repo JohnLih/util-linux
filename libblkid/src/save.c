@@ -23,6 +23,7 @@
 #endif
 
 #include "closestream.h"
+#include "fileutils.h"
 
 #include "blkidP.h"
 
@@ -85,9 +86,6 @@ int blkid_flush_cache(blkid_cache cache)
 	int fd, ret = 0;
 	struct stat st;
 
-	if (!cache)
-		return -BLKID_ERR_PARAM;
-
 	if (list_empty(&cache->bic_devs) ||
 	    !(cache->bic_flags & BLKID_BIC_FL_CHANGED)) {
 		DBG(SAVE, ul_debug("skipping cache file write"));
@@ -133,7 +131,7 @@ int blkid_flush_cache(blkid_cache cache)
 		tmp = malloc(strlen(filename) + 8);
 		if (tmp) {
 			sprintf(tmp, "%s-XXXXXX", filename);
-			fd = mkostemp(tmp, O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC);
+			fd = mkstemp_cloexec(tmp);
 			if (fd >= 0) {
 				if (fchmod(fd, 0644) != 0)
 					DBG(SAVE, ul_debug("%s: fchmod failed", filename));

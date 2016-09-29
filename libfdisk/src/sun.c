@@ -56,7 +56,7 @@ static struct fdisk_parttype sun_parttypes[] = {
 	{ 0, NULL }
 };
 
-/* return poiter buffer with on-disk data */
+/* return pointer buffer with on-disk data */
 static inline struct sun_disklabel *self_disklabel(struct fdisk_context *cxt)
 {
 	assert(cxt);
@@ -225,7 +225,6 @@ static int sun_create_disklabel(struct fdisk_context *cxt)
 	sunlabel->vtoc.sanity = cpu_to_be32(SUN_VTOC_SANITY);
 	sunlabel->vtoc.nparts = cpu_to_be16(SUN_MAXPARTITIONS);
 
-#ifdef HDIO_GETGEO
 	if (cxt->geom.heads && cxt->geom.sectors) {
 		fdisk_sector_t llsectors;
 
@@ -246,7 +245,6 @@ static int sun_create_disklabel(struct fdisk_context *cxt)
 				cxt->dev_path, cxt->geom.cylinders);
 		}
 	} else
-#endif
 		ask_geom(cxt);
 
 	sunlabel->acyl   = cpu_to_be16(0);
@@ -377,6 +375,11 @@ static void fetch_sun(struct fdisk_context *cxt,
 		}
 	}
 }
+
+/* non-Linux qsort_r(3) has usually differently ordered arguments */
+#if !defined (__linux__) || !defined (__GLIBC__)
+# undef HAVE_QSORT_R
+#endif
 
 #ifdef HAVE_QSORT_R
 static int verify_sun_cmp(int *a, int *b, void *data)
@@ -780,7 +783,7 @@ static int sun_get_disklabel_item(struct fdisk_context *cxt, struct fdisk_labeli
 		break;
 	default:
 		if (item->id < __FDISK_NLABELITEMS)
-			rc = 1;	/* unssupported generic item */
+			rc = 1;	/* unsupported generic item */
 		else
 			rc = 2;	/* out of range */
 		break;

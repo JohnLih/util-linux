@@ -185,7 +185,7 @@ static int __mnt_optstr_append_option(char **optstr,
 	sz = osz + nsz + 1;		/* 1: '\0' */
 	if (osz)
 		sz++;			/* ',' options separator */
-	if (vsz)
+	if (value)
 		sz += vsz + 1;		/* 1: '=' */
 
 	p = realloc(*optstr, sz);
@@ -201,7 +201,7 @@ static int __mnt_optstr_append_option(char **optstr,
 	memcpy(p, name, nsz);
 	p += nsz;
 
-	if (vsz) {
+	if (value) {
 		*p++ = '=';
 		memcpy(p, value, vsz);
 		p += vsz;
@@ -959,7 +959,6 @@ static int set_uint_value(char **optstr, unsigned int num,
  */
 int mnt_optstr_fix_uid(char **optstr, char *value, size_t valsz, char **next)
 {
-	int rc = 0;
 	char *end;
 
 	if (!optstr || !*optstr || !value || !valsz)
@@ -971,10 +970,11 @@ int mnt_optstr_fix_uid(char **optstr, char *value, size_t valsz, char **next)
 
 	if (valsz == 7 && !strncmp(value, "useruid", 7) &&
 	    (*(value + 7) == ',' || !*(value + 7)))
-		rc = set_uint_value(optstr, getuid(), value, end, next);
+		return set_uint_value(optstr, getuid(), value, end, next);
 
 	else if (!isdigit(*value)) {
 		uid_t id;
+		int rc;
 		char *p = strndup(value, valsz);
 		if (!p)
 			return -ENOMEM;
@@ -982,16 +982,17 @@ int mnt_optstr_fix_uid(char **optstr, char *value, size_t valsz, char **next)
 		free(p);
 
 		if (!rc)
-			rc = set_uint_value(optstr, id, value, end, next);
+			return set_uint_value(optstr, id, value, end, next);
+	}
 
-	} else if (next) {
-		/* nothing */
+	if (next) {
+		/* no change, let's keep the original value */
 		*next = value + valsz;
 		if (**next == ',')
 			(*next)++;
 	}
 
-	return rc;
+	return 0;
 }
 
 /*
@@ -1006,7 +1007,6 @@ int mnt_optstr_fix_uid(char **optstr, char *value, size_t valsz, char **next)
  */
 int mnt_optstr_fix_gid(char **optstr, char *value, size_t valsz, char **next)
 {
-	int rc = 0;
 	char *end;
 
 	if (!optstr || !*optstr || !value || !valsz)
@@ -1018,9 +1018,10 @@ int mnt_optstr_fix_gid(char **optstr, char *value, size_t valsz, char **next)
 
 	if (valsz == 7 && !strncmp(value, "usergid", 7) &&
 	    (*(value + 7) == ',' || !*(value + 7)))
-		rc = set_uint_value(optstr, getgid(), value, end, next);
+		return set_uint_value(optstr, getgid(), value, end, next);
 
 	else if (!isdigit(*value)) {
+		int rc;
 		gid_t id;
 		char *p = strndup(value, valsz);
 		if (!p)
@@ -1029,15 +1030,17 @@ int mnt_optstr_fix_gid(char **optstr, char *value, size_t valsz, char **next)
 		free(p);
 
 		if (!rc)
-			rc = set_uint_value(optstr, id, value, end, next);
+			return set_uint_value(optstr, id, value, end, next);
 
-	} else if (next) {
+	}
+
+	if (next) {
 		/* nothing */
 		*next = value + valsz;
 		if (**next == ',')
 			(*next)++;
 	}
-	return rc;
+	return 0;
 }
 
 /*
@@ -1078,7 +1081,7 @@ int mnt_optstr_fix_user(char **optstr)
 
 #ifdef TEST_PROGRAM
 
-int test_append(struct libmnt_test *ts, int argc, char *argv[])
+static int test_append(struct libmnt_test *ts, int argc, char *argv[])
 {
 	const char *value = NULL, *name;
 	char *optstr;
@@ -1099,7 +1102,7 @@ int test_append(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_prepend(struct libmnt_test *ts, int argc, char *argv[])
+static int test_prepend(struct libmnt_test *ts, int argc, char *argv[])
 {
 	const char *value = NULL, *name;
 	char *optstr;
@@ -1120,7 +1123,7 @@ int test_prepend(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_split(struct libmnt_test *ts, int argc, char *argv[])
+static int test_split(struct libmnt_test *ts, int argc, char *argv[])
 {
 	char *optstr, *user = NULL, *fs = NULL, *vfs = NULL;
 	int rc;
@@ -1144,7 +1147,7 @@ int test_split(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_flags(struct libmnt_test *ts, int argc, char *argv[])
+static int test_flags(struct libmnt_test *ts, int argc, char *argv[])
 {
 	char *optstr;
 	int rc;
@@ -1170,7 +1173,7 @@ int test_flags(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_apply(struct libmnt_test *ts, int argc, char *argv[])
+static int test_apply(struct libmnt_test *ts, int argc, char *argv[])
 {
 	char *optstr;
 	int rc, map;
@@ -1200,7 +1203,7 @@ int test_apply(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_set(struct libmnt_test *ts, int argc, char *argv[])
+static int test_set(struct libmnt_test *ts, int argc, char *argv[])
 {
 	const char *value = NULL, *name;
 	char *optstr;
@@ -1221,7 +1224,7 @@ int test_set(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_get(struct libmnt_test *ts, int argc, char *argv[])
+static int test_get(struct libmnt_test *ts, int argc, char *argv[])
 {
 	char *optstr;
 	const char *name;
@@ -1250,7 +1253,7 @@ int test_get(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_remove(struct libmnt_test *ts, int argc, char *argv[])
+static int test_remove(struct libmnt_test *ts, int argc, char *argv[])
 {
 	const char *name;
 	char *optstr;
@@ -1268,7 +1271,7 @@ int test_remove(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_dedup(struct libmnt_test *ts, int argc, char *argv[])
+static int test_dedup(struct libmnt_test *ts, int argc, char *argv[])
 {
 	const char *name;
 	char *optstr;
@@ -1286,7 +1289,7 @@ int test_dedup(struct libmnt_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_fix(struct libmnt_test *ts, int argc, char *argv[])
+static int test_fix(struct libmnt_test *ts, int argc, char *argv[])
 {
 	char *optstr;
 	int rc = 0;

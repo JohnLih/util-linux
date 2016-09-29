@@ -16,6 +16,8 @@ TS_HELPER_LIBMOUNT_TAB="$top_builddir/test_mount_tab"
 TS_HELPER_LIBMOUNT_UPDATE="$top_builddir/test_mount_tab_update"
 TS_HELPER_LIBMOUNT_UTILS="$top_builddir/test_mount_utils"
 TS_HELPER_LIBMOUNT_DEBUG="$top_builddir/test_mount_debug"
+TS_HELPER_LIBSMARTCOLS_FROMFILE="$top_builddir/sample-scols-fromfile"
+TS_HELPER_LIBSMARTCOLS_TITLE="$top_builddir/sample-scols-title"
 TS_HELPER_PYLIBMOUNT_CONTEXT="$top_srcdir/libmount/python/test_mount_context.py"
 TS_HELPER_PYLIBMOUNT_TAB="$top_srcdir/libmount/python/test_mount_tab.py"
 TS_HELPER_PYLIBMOUNT_UPDATE="$top_srcdir/libmount/python/test_mount_tab_update.py"
@@ -30,6 +32,7 @@ TS_HELPER_SCRIPT="$top_builddir/test_script"
 TS_HELPER_SIGRECEIVE="$top_builddir/test_sigreceive"
 TS_HELPER_STRUTILS="$top_builddir/test_strutils"
 TS_HELPER_SYSINFO="$top_builddir/test_sysinfo"
+TS_HELPER_UUID_PARSER="$top_builddir/test_uuid_parser"
 
 # paths to commands
 TS_CMD_ADDPART=${TS_CMD_ADDPART:-"$top_builddir/addpart"}
@@ -84,6 +87,8 @@ TS_CMD_TAILF=${TS_CMD_TAILF-"$top_builddir/tailf"}
 TS_CMD_UL=${TS_CMD_UL-"$top_builddir/ul"}
 TS_CMD_UMOUNT=${TS_CMD_UMOUNT:-"$top_builddir/umount"}
 TS_CMD_UTMPDUMP=${TS_CMD_UTMPDUMP-"$top_builddir/utmpdump"}
+TS_CMD_UUIDD=${TS_CMD_UUIDD-"$top_builddir/uuidd"}
 TS_CMD_UUIDGEN=${TS_CMD_UUIDGEN-"$top_builddir/uuidgen"}
 TS_CMD_WHEREIS=${TS_CMD_WHEREIS-"$top_builddir/whereis"}
 TS_CMD_WIPEFS=${TS_CMD_WIPEFS-"$top_builddir/wipefs"}
+TS_CMD_CHRT=${TS_CMD_CHRT-"$top_builddir/chrt"}

@@ -34,22 +34,23 @@ function num_cpus()
 	fi
 }
 
+function find_test_scripts()
+{
+	local searchdir="$1"
+	find "$searchdir" -type f -regex ".*/[^\.~]*" \
+		\( -perm -u=x -o -perm -g=x -o -perm -o=x \)
+}
+
 while [ -n "$1" ]; do
 	case "$1" in
-	--force)
-		OPTS="$OPTS --force"
-		;;
-	--fake)
-		OPTS="$OPTS --fake"
-		;;
-	--memcheck)
-		OPTS="$OPTS --memcheck"
-		;;
-	--verbose)
-		OPTS="$OPTS --verbose"
-		;;
-	--skip-loopdevs)
-		OPTS="$OPTS --skip-loopdevs"
+	--force |\
+	--fake |\
+	--memcheck |\
+	--verbose  |\
+	--skip-loopdevs |\
+	--parsable)
+		# these options are simply forwarded to the test scripts
+		OPTS="$OPTS $1"
 		;;
 	--nonroot)
 		if [ $(id -ru) -eq 0 ]; then
@@ -65,11 +66,9 @@ while [ -n "$1" ]; do
 		;;
 	--parallel=*)
 		paraller_jobs="${1##--parallel=}"
-		OPTS="$OPTS --parallel"
 		;;
 	--parallel)
 		paraller_jobs=$(num_cpus)
-		OPTS="$OPTS --parallel"
 		;;
 	--exclude=*)
 		EXCLUDETESTS="${1##--exclude=}"
@@ -118,8 +117,8 @@ declare -a comps
 if [ -n "$SUBTESTS" ]; then
 	# selected tests only
 	for s in $SUBTESTS; do
-		if [ -d "$top_srcdir/tests/ts/$s" ]; then
-			comps+=( $(find $top_srcdir/tests/ts/$s -type f -perm /a+x -regex ".*/[^\.~]*") )
+		if [ -e "$top_srcdir/tests/ts/$s" ]; then
+			comps+=( $(find_test_scripts "$top_srcdir/tests/ts/$s") ) || exit 1
 		else
 			echo "Unknown test component '$s'"
 			exit 1
@@ -131,7 +130,7 @@ else
 		exit 1
 	fi
 
-	comps=( $(find $top_srcdir/tests/ts/ -type f -perm /a+x -regex ".*/[^\.~]*") )
+	comps=( $(find_test_scripts "$top_srcdir/tests/ts") ) || exit 1
 fi
 
 if [ -n "$EXCLUDETESTS" ]; then
@@ -161,9 +160,15 @@ echo "                    For development purpose only.                    "
 echo "                 Don't execute on production system!                 "
 echo
 
+# TODO: add more information about system
+printf "%13s: %-30s    " "kernel" "$(uname -r)"
+echo
+echo
+
 if [ $paraller_jobs -gt 1 ]; then
 	echo "              Executing the tests in parallel ($paraller_jobs jobs)    "
 	echo
+	OPTS="$OPTS --parallel"
 fi
 
 count=0

@@ -56,6 +56,7 @@
 #include "pathnames.h"
 #include "logindefs.h"
 #include "procutils.h"
+#include "timeutils.h"
 
 /*
  * column description
@@ -293,22 +294,6 @@ static inline size_t err_columns_index(size_t arysz, size_t idx)
 #define add_column(ary, n, id)	\
 		((ary)[ err_columns_index(ARRAY_SIZE(ary), (n)) ] = (id))
 
-static struct timeval now;
-
-static int date_is_today(time_t t)
-{
-	if (now.tv_sec == 0)
-		gettimeofday(&now, NULL);
-	return t / (3600 * 24) == now.tv_sec / (3600 * 24);
-}
-
-static int date_is_thisyear(time_t t)
-{
-	if (now.tv_sec == 0)
-		gettimeofday(&now, NULL);
-	return t / (3600 * 24 * 365) == now.tv_sec / (3600 * 24 * 365);
-}
-
 static int column_name_to_id(const char *name, size_t namesz)
 {
 	size_t i;
@@ -323,37 +308,44 @@ static int column_name_to_id(const char *name, size_t namesz)
 	return -1;
 }
 
+static struct timeval now;
+
 static char *make_time(int mode, time_t time)
 {
-	char *s;
-	struct tm tm;
+	int rc = 0;
 	char buf[64] = {0};
-
-	localtime_r(&time, &tm);
 
 	switch(mode) {
 	case TIME_FULL:
+	{
+		char *s;
+		struct tm tm;
+		localtime_r(&time, &tm);
+
 		asctime_r(&tm, buf);
 		if (*(s = buf + strlen(buf) - 1) == '\n')
 			*s = '\0';
+		rc = 0;
 		break;
+	}
 	case TIME_SHORT:
-		if (date_is_today(time))
-			strftime(buf, sizeof(buf), "%H:%M:%S", &tm);
-		else if (date_is_thisyear(time))
-			strftime(buf, sizeof(buf), "%b%d/%H:%M", &tm);
-		else
-			strftime(buf, sizeof(buf), "%Y-%b%d", &tm);
+		rc = strtime_short(&time, &now, UL_SHORTTIME_THISYEAR_HHMM,
+				buf, sizeof(buf));
 		break;
 	case TIME_ISO:
-		strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", &tm);
+		rc = strtime_iso(&time, ISO_8601_DATE|ISO_8601_TIME|ISO_8601_TIMEZONE,
+				   buf, sizeof(buf));
 		break;
 	case TIME_ISO_SHORT:
-		strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
+		rc = strtime_iso(&time, ISO_8601_DATE, buf, sizeof(buf));
 		break;
 	default:
 		errx(EXIT_FAILURE, _("unsupported time type"));
 	}
+
+	if (rc)
+		 errx(EXIT_FAILURE, _("failed to compose time string"));
+
 	return xstrdup(buf);
 }
 
@@ -397,7 +389,7 @@ again:
 			x = snprintf(p, len, "%s,", grp->gr_name);
 		}
 
-		if (x < 0 || (size_t) x + 1 > len) {
+		if (x < 0 || (size_t) x >= len) {
 			size_t cur = p - res;
 
 			maxlen *= 2;
@@ -528,20 +520,23 @@ static int parse_btmp(struct lslogins_control *ctl, char *path)
 static int get_sgroups(gid_t **list, size_t *len, struct passwd *pwd)
 {
 	size_t n = 0;
+	int ngroups = 0;
 
 	*len = 0;
 	*list = NULL;
 
 	/* first let's get a supp. group count */
-	getgrouplist(pwd->pw_name, pwd->pw_gid, *list, (int *) len);
-	if (!*len)
+	getgrouplist(pwd->pw_name, pwd->pw_gid, *list, &ngroups);
+	if (!ngroups)
 		return -1;
 
-	*list = xcalloc(1, *len * sizeof(gid_t));
+	*list = xcalloc(1, ngroups * sizeof(gid_t));
 
 	/* now for the actual list of GIDs */
-	if (-1 == getgrouplist(pwd->pw_name, pwd->pw_gid, *list, (int *) len))
+	if (-1 == getgrouplist(pwd->pw_name, pwd->pw_gid, *list, &ngroups))
 		return -1;
+
+	*len = (size_t) ngroups;
 
 	/* getgroups also returns the user's primary GID - dispose of it */
 	while (n < *len) {
@@ -552,6 +547,7 @@ static int get_sgroups(gid_t **list, size_t *len, struct passwd *pwd)
 
 	if (*len)
 		(*list)[n] = (*list)[--(*len)];
+
 	return 0;
 }
 
@@ -770,14 +766,6 @@ static struct lslogins_user *get_user_info(struct lslogins_control *ctl, const c
 	return user;
 }
 
-/* some UNIX implementations set errno iff a passwd/grp/...
- * entry was not found. The original UNIX logins(1) utility always
- * ignores invalid login/group names, so we're going to as well.*/
-#define IS_REAL_ERRNO(e) !((e) == ENOENT || (e) == ESRCH || \
-		(e) == EBADF || (e) == EPERM || (e) == EAGAIN)
-
-/* get a definitive list of users we want info about... */
-
 static int str_to_uint(char *s, unsigned int *ul)
 {
 	char *end;
@@ -789,6 +777,7 @@ static int str_to_uint(char *s, unsigned int *ul)
 	return 1;
 }
 
+/* get a definitive list of users we want info about... */
 static int get_ulist(struct lslogins_control *ctl, char *logins, char *groups)
 {
 	char *u, *g;
@@ -826,7 +815,7 @@ static int get_ulist(struct lslogins_control *ctl, char *logins, char *groups)
 	}
 
 	if (groups) {
-		/* FIXME: this might lead to duplicit entries, although not visible
+		/* FIXME: this might lead to duplicate entries, although not visible
 		 * in output, crunching a user's info multiple times is very redundant */
 		while ((g = strtok(groups, ","))) {
 			n = 0;
@@ -882,13 +871,18 @@ static struct lslogins_user *get_next_user(struct lslogins_control *ctl)
 	return u;
 }
 
+/* some UNIX implementations set errno iff a passwd/grp/...
+ * entry was not found. The original UNIX logins(1) utility always
+ * ignores invalid login/group names, so we're going to as well.*/
+#define IS_REAL_ERRNO(e) !((e) == ENOENT || (e) == ESRCH || \
+		(e) == EBADF || (e) == EPERM || (e) == EAGAIN)
+
 static int get_user(struct lslogins_control *ctl, struct lslogins_user **user,
 		    const char *username)
 {
 	*user = get_user_info(ctl, username);
-	if (!*user)
-		if (IS_REAL_ERRNO(errno))
-			return -1;
+	if (!*user && IS_REAL_ERRNO(errno))
+		return -1;
 	return 0;
 }
 
@@ -1206,7 +1200,7 @@ static void free_user(void *f)
 	free(u);
 }
 
-static int parse_time_mode(const char *optarg)
+static int parse_time_mode(const char *s)
 {
 	struct lslogins_timefmt {
 		const char *name;
@@ -1220,10 +1214,10 @@ static int parse_time_mode(const char *optarg)
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(timefmts); i++) {
-		if (strcmp(timefmts[i].name, optarg) == 0)
+		if (strcmp(timefmts[i].name, s) == 0)
 			return timefmts[i].val;
 	}
-	errx(EXIT_FAILURE, _("unknown time format: %s"), optarg);
+	errx(EXIT_FAILURE, _("unknown time format: %s"), s);
 }
 
 static void __attribute__((__noreturn__)) usage(FILE *out)

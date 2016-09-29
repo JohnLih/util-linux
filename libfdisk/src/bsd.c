@@ -191,7 +191,7 @@ static int bsd_probe_label(struct fdisk_context *cxt)
 	int rc = 0;
 
 	if (cxt->parent)
-		rc = bsd_assign_dos_partition(cxt);	/* nested BSD partiotn table */
+		rc = bsd_assign_dos_partition(cxt);	/* nested BSD partition table */
 	if (!rc)
 		rc = bsd_readlabel(cxt);
 	if (!rc)
@@ -524,7 +524,7 @@ static int bsd_get_disklabel_item(struct fdisk_context *cxt, struct fdisk_labeli
 		break;
 	default:
 		if (item->id < __FDISK_NLABELITEMS)
-			rc = 1;	/* unssupported generic item */
+			rc = 1;	/* unsupported generic item */
 		else
 			rc = 2;	/* out of range */
 		break;
@@ -897,7 +897,7 @@ static int bsd_write_disklabel(struct fdisk_context *cxt)
 	sync_disks(cxt);
 
 	if (cxt->parent && fdisk_label_is_changed(cxt->parent->label))
-		fdisk_info(cxt, _("Disklabel written to %s (don't forget to write %s disklable too)."),
+		fdisk_info(cxt, _("Disklabel written to %s.  (Don't forget to write the %s disklabel too.)"),
 				cxt->dev_path, cxt->parent->dev_path);
 	else
 		fdisk_info(cxt, _("Disklabel written to %s."), cxt->dev_path);

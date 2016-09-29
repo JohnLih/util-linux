@@ -44,7 +44,7 @@ static int do_scale_by_power (uintmax_t *x, int base, int power)
  * for example:
  *		10KB	= 10000
  *
- * The optinal 'power' variable returns number associated with used suffix
+ * The optional 'power' variable returns number associated with used suffix
  * {K,M,G,T,P,E,Z,Y}  = {1,2,3,4,5,6,7,8}.
  *
  * The function also supports decimal point, for example:
@@ -91,7 +91,7 @@ int parse_size(const char *str, uintmax_t *res, int *power)
 
 	if (p == str ||
 	    (errno != 0 && (x == UINTMAX_MAX || x == 0))) {
-		rc = errno ? -errno : -1;
+		rc = errno ? -errno : -EINVAL;
 		goto err;
 	}
 	if (!p || !*p)
@@ -119,7 +119,7 @@ check_suffix:
 			frac = strtoumax(fstr, &p, 0);
 			if (p == fstr ||
 			    (errno != 0 && (frac == UINTMAX_MAX || frac == 0))) {
-				rc = errno ? -errno : -1;
+				rc = errno ? -errno : -EINVAL;
 				goto err;
 			}
 			if (frac && (!p  || !*p)) {
@@ -164,6 +164,8 @@ check_suffix:
 done:
 	*res = x;
 err:
+	if (rc < 0)
+		errno = -rc;
 	return rc;
 }
 
@@ -177,6 +179,15 @@ int isdigit_string(const char *str)
 	const char *p;
 
 	for (p = str; p && *p && isdigit((unsigned char) *p); p++);
+
+	return p && p > str && !*p;
+}
+
+int isxdigit_string(const char *str)
+{
+	const char *p;
+
+	for (p = str; p && *p && isxdigit((unsigned char) *p); p++);
 
 	return p && p > str && !*p;
 }
@@ -245,7 +256,7 @@ char *strnchr(const char *s, size_t maxlen, int c)
 char *strndup(const char *s, size_t n)
 {
 	size_t len = strnlen(s, n);
-	char *new = (char *) malloc((len + 1) * sizeof(char));
+	char *new = malloc((len + 1) * sizeof(char));
 	if (!new)
 		return NULL;
 	new[len] = '\0';
@@ -257,9 +268,10 @@ int16_t strtos16_or_err(const char *str, const char *errmesg)
 {
 	int32_t num = strtos32_or_err(str, errmesg);
 
-	if (num < INT16_MIN || num > INT16_MAX)
-		errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
-
+	if (num < INT16_MIN || num > INT16_MAX) {
+		errno = ERANGE;
+		err(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
+	}
 	return num;
 }
 
@@ -267,9 +279,10 @@ uint16_t strtou16_or_err(const char *str, const char *errmesg)
 {
 	uint32_t num = strtou32_or_err(str, errmesg);
 
-	if (num > UINT16_MAX)
-		errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
-
+	if (num > UINT16_MAX) {
+		errno = ERANGE;
+		err(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
+	}
 	return num;
 }
 
@@ -277,9 +290,10 @@ int32_t strtos32_or_err(const char *str, const char *errmesg)
 {
 	int64_t num = strtos64_or_err(str, errmesg);
 
-	if (num < INT32_MIN || num > INT32_MAX)
-		errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
-
+	if (num < INT32_MIN || num > INT32_MAX) {
+		errno = ERANGE;
+		err(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
+	}
 	return num;
 }
 
@@ -287,9 +301,10 @@ uint32_t strtou32_or_err(const char *str, const char *errmesg)
 {
 	uint64_t num = strtou64_or_err(str, errmesg);
 
-	if (num > UINT32_MAX)
-		errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
-
+	if (num > UINT32_MAX) {
+		errno = ERANGE;
+		err(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
+	}
 	return num;
 }
 
@@ -298,9 +313,9 @@ int64_t strtos64_or_err(const char *str, const char *errmesg)
 	int64_t num;
 	char *end = NULL;
 
+	errno = 0;
 	if (str == NULL || *str == '\0')
 		goto err;
-	errno = 0;
 	num = strtoimax(str, &end, 10);
 
 	if (errno || str == end || (end && *end))
@@ -308,7 +323,7 @@ int64_t strtos64_or_err(const char *str, const char *errmesg)
 
 	return num;
 err:
-	if (errno)
+	if (errno == ERANGE)
 		err(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
 
 	errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
@@ -319,9 +334,9 @@ uint64_t strtou64_or_err(const char *str, const char *errmesg)
 	uintmax_t num;
 	char *end = NULL;
 
+	errno = 0;
 	if (str == NULL || *str == '\0')
 		goto err;
-	errno = 0;
 	num = strtoumax(str, &end, 10);
 
 	if (errno || str == end || (end && *end))
@@ -329,7 +344,7 @@ uint64_t strtou64_or_err(const char *str, const char *errmesg)
 
 	return num;
 err:
-	if (errno)
+	if (errno == ERANGE)
 		err(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
 
 	errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
@@ -341,9 +356,9 @@ double strtod_or_err(const char *str, const char *errmesg)
 	double num;
 	char *end = NULL;
 
+	errno = 0;
 	if (str == NULL || *str == '\0')
 		goto err;
-	errno = 0;
 	num = strtod(str, &end);
 
 	if (errno || str == end || (end && *end))
@@ -351,7 +366,7 @@ double strtod_or_err(const char *str, const char *errmesg)
 
 	return num;
 err:
-	if (errno)
+	if (errno == ERANGE)
 		err(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
 
 	errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
@@ -362,9 +377,9 @@ long strtol_or_err(const char *str, const char *errmesg)
 	long num;
 	char *end = NULL;
 
+	errno = 0;
 	if (str == NULL || *str == '\0')
 		goto err;
-	errno = 0;
 	num = strtol(str, &end, 10);
 
 	if (errno || str == end || (end && *end))
@@ -372,8 +387,9 @@ long strtol_or_err(const char *str, const char *errmesg)
 
 	return num;
 err:
-	if (errno)
+	if (errno == ERANGE)
 		err(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
+
 	errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
 }
 
@@ -382,9 +398,9 @@ unsigned long strtoul_or_err(const char *str, const char *errmesg)
 	unsigned long num;
 	char *end = NULL;
 
+	errno = 0;
 	if (str == NULL || *str == '\0')
 		goto err;
-	errno = 0;
 	num = strtoul(str, &end, 10);
 
 	if (errno || str == end || (end && *end))
@@ -392,7 +408,7 @@ unsigned long strtoul_or_err(const char *str, const char *errmesg)
 
 	return num;
 err:
-	if (errno)
+	if (errno == ERANGE)
 		err(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
 
 	errx(STRTOXX_EXIT_CODE, "%s: '%s'", errmesg, str);
@@ -425,7 +441,7 @@ void strtotimeval_or_err(const char *str, struct timeval *tv, const char *errmes
  * Converts stat->st_mode to ls(1)-like mode string. The size of "str" must
  * be 11 bytes.
  */
-void strmode(mode_t mode, char *str)
+void xstrmode(mode_t mode, char *str)
 {
 	unsigned short i = 0;
 
@@ -519,7 +535,7 @@ char *size_to_human_string(int options, uint64_t bytes)
 
 		if (!dp || !*dp)
 			dp = ".";
-		snprintf(buf, sizeof(buf), "%d%s%jd%s", dec, dp, frac, suffix);
+		snprintf(buf, sizeof(buf), "%d%s%" PRIu64 "%s", dec, dp, frac, suffix);
 	} else
 		snprintf(buf, sizeof(buf), "%d%s", dec, suffix);
 
@@ -718,7 +734,7 @@ int parse_range(const char *str, int *lower, int *upper, int def)
 			return -1;
 
 		if (*end == ':' && !*(end + 1))		/* <M:> */
-			*upper = 0;
+			*upper = def;
 		else if (*end == '-' || *end == ':') {	/* <M:N> <M-N> */
 			str = end + 1;
 			end = NULL;
@@ -732,38 +748,55 @@ int parse_range(const char *str, int *lower, int *upper, int def)
 	return 0;
 }
 
-/*
- * Compare two strings for equality, ignoring at most one trailing
- * slash.
- */
-int streq_except_trailing_slash(const char *s1, const char *s2)
+static const char *next_path_segment(const char *str, size_t *sz)
 {
-	int equal;
+	const char *start, *p;
 
-	if (!s1 && !s2)
-		return 1;
-	if (!s1 || !s2)
-		return 0;
+	start = str;
+	*sz = 0;
+	while (start && *start == '/' && *(start + 1) == '/')
+		start++;
 
-	equal = !strcmp(s1, s2);
+	if (!start || !*start)
+		return NULL;
 
-	if (!equal) {
-		size_t len1 = strlen(s1);
-		size_t len2 = strlen(s2);
-
-		if (len1 && *(s1 + len1 - 1) == '/')
-			len1--;
-		if (len2 && *(s2 + len2 - 1) == '/')
-			len2--;
-		if (len1 != len2)
-			return 0;
-
-		equal = !strncmp(s1, s2, len1);
+	for (*sz = 1, p = start + 1; *p && *p != '/'; p++) {
+		(*sz)++;
 	}
 
-	return equal;
+	return start;
 }
 
+int streq_paths(const char *a, const char *b)
+{
+	while (a && b) {
+		size_t a_sz, b_sz;
+		const char *a_seg = next_path_segment(a, &a_sz);
+		const char *b_seg = next_path_segment(b, &b_sz);
+
+		/*
+		fprintf(stderr, "A>>>(%zu) '%s'\n", a_sz, a_seg);
+		fprintf(stderr, "B>>>(%zu) '%s'\n", b_sz, b_seg);
+		*/
+
+		/* end of the path */
+		if (a_sz + b_sz == 0)
+			return 1;
+
+		/* ignore tailing slash */
+		if (a_sz + b_sz == 1 &&
+		    ((a_seg && *a_seg == '/') || (b_seg && *b_seg == '/')))
+			return 1;
+
+		if (a_sz != b_sz || strncmp(a_seg, b_seg, a_sz) != 0)
+			return 0;
+
+		a = a_seg + a_sz;
+		b = b_seg + b_sz;
+	};
+
+	return 0;
+}
 
 char *strnappend(const char *s, const char *suffix, size_t b)
 {
@@ -800,6 +833,23 @@ char *strappend(const char *s, const char *suffix)
         return strnappend(s, suffix, suffix ? strlen(suffix) : 0);
 }
 
+char *strfappend(const char *s, const char *format, ...)
+{
+	va_list ap;
+	char *val, *res;
+	int sz;
+
+	va_start(ap, format);
+	sz = vasprintf(&val, format, ap);
+	va_end(ap);
+
+	if (sz < 0)
+		return NULL;
+
+	res = strnappend(s, val, sz);
+	free(val);
+	return res;
+}
 
 static size_t strcspn_escaped(const char *s, const char *reject)
 {
@@ -867,7 +917,7 @@ const char *split(const char **state, size_t *l, const char *separator, int quot
 /* Rewind file pointer forward to new line.  */
 int skip_fline(FILE *fp)
 {
-	char ch;
+	int ch;
 
 	do {
 		if ((ch = fgetc(fp)) == EOF)
@@ -879,15 +929,13 @@ int skip_fline(FILE *fp)
 
 #ifdef TEST_PROGRAM
 
-int main(int argc, char *argv[])
+static int test_strutils_sizes(int argc, char *argv[])
 {
 	uintmax_t size = 0;
 	char *hum, *hum2;
 
-	if (argc < 2) {
-		fprintf(stderr, "usage: %s <number>[suffix]\n",	argv[0]);
-		exit(EXIT_FAILURE);
-	}
+	if (argc < 2)
+		return EXIT_FAILURE;
 
 	if (strtosize(argv[1], &size))
 		errx(EXIT_FAILURE, "invalid size '%s' value", argv[1]);
@@ -901,5 +949,34 @@ int main(int argc, char *argv[])
 	free(hum2);
 
 	return EXIT_SUCCESS;
+}
+
+static int test_strutils_cmp_paths(int argc, char *argv[])
+{
+	int rc = streq_paths(argv[1], argv[2]);
+
+	if (argc < 3)
+		return EXIT_FAILURE;
+
+	printf("%s: '%s' '%s'\n", rc == 1 ? "YES" : "NOT", argv[1], argv[2]);
+	return EXIT_SUCCESS;
+}
+
+int main(int argc, char *argv[])
+{
+	if (argc == 3 && strcmp(argv[1], "--size") == 0)
+		return test_strutils_sizes(argc - 1, argv + 1);
+
+	else if (argc == 4 && strcmp(argv[1], "--cmp-paths") == 0)
+		return test_strutils_cmp_paths(argc - 1, argv + 1);
+
+	else {
+		fprintf(stderr, "usage: %1$s --size <number>[suffix]\n"
+				"       %1$s --cmp-paths <path> <path>\n",
+				argv[0]);
+		exit(EXIT_FAILURE);
+	}
+
+	return EXIT_FAILURE;
 }
 #endif /* TEST_PROGRAM */

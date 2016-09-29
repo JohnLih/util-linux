@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <errno.h>
 
 /* default strtoxx_or_err() exit code */
 #ifndef STRTOXX_EXIT_CODE
@@ -36,6 +37,7 @@ extern void strtotimeval_or_err(const char *str, struct timeval *tv,
 		const char *errmesg);
 
 extern int isdigit_string(const char *str);
+extern int isxdigit_string(const char *str);
 
 extern int parse_switch(const char *arg, const char *errmesg, ...);
 
@@ -59,26 +61,30 @@ static inline void xstrncpy(char *dest, const char *src, size_t n)
 	dest[n-1] = 0;
 }
 
-static inline char *strdup_to_offset(void *stru, size_t offset, const char *str)
+static inline int strdup_to_offset(void *stru, size_t offset, const char *str)
 {
 	char *n = NULL;
-	char **o = (char **) ((char *) stru + offset);
+	char **o;
 
+	if (!stru)
+		return -EINVAL;
+
+	o = (char **) ((char *) stru + offset);
 	if (str) {
 		n = strdup(str);
 		if (!n)
-			return NULL;
+			return -ENOMEM;
 	}
 
 	free(*o);
 	*o = n;
-	return n;
+	return 0;
 }
 
 #define strdup_to_struct_member(_s, _m, _str) \
 		strdup_to_offset((void *) _s, offsetof(__typeof__(*(_s)), _m), _str)
 
-extern void strmode(mode_t mode, char *str);
+extern void xstrmode(mode_t mode, char *str);
 
 /* Options for size_to_human_string() */
 enum
@@ -104,7 +110,7 @@ extern int string_to_bitmask(const char *list,
 			     long (*name2flag)(const char *, size_t));
 extern int parse_range(const char *str, int *lower, int *upper, int def);
 
-extern int streq_except_trailing_slash(const char *s1, const char *s2);
+extern int streq_paths(const char *a, const char *b);
 
 /*
  * Match string beginning.
@@ -206,6 +212,8 @@ static inline size_t ltrim_whitespace(unsigned char *str)
 
 extern char *strnappend(const char *s, const char *suffix, size_t b);
 extern char *strappend(const char *s, const char *suffix);
+extern char *strfappend(const char *s, const char *format, ...)
+		 __attribute__ ((__format__ (__printf__, 2, 0)));
 extern const char *split(const char **state, size_t *l, const char *separator, int quoted);
 
 extern int skip_fline(FILE *fp);

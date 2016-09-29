@@ -51,6 +51,8 @@
 #include <netdb.h>
 #include <getopt.h>
 #include <pwd.h>
+#include <signal.h>
+#include <sys/uio.h>
 
 #include "all-io.h"
 #include "c.h"
@@ -59,6 +61,8 @@
 #include "pathnames.h"
 #include "strutils.h"
 #include "xalloc.h"
+#include "strv.h"
+#include "list.h"
 
 #define	SYSLOG_NAMES
 #include <syslog.h>
@@ -93,7 +97,17 @@ enum {
 	OPT_MSGID,
 	OPT_NOACT,
 	OPT_ID,
+	OPT_STRUCTURED_DATA_ID,
+	OPT_STRUCTURED_DATA_PARAM,
 	OPT_OCTET_COUNT
+};
+
+/* rfc5424 structured data */
+struct structured_data {
+	char *id;		/* SD-ID */
+	char **params;		/* array with SD-PARAMs */
+
+	struct list_head	sds;
 };
 
 struct logger_ctl {
@@ -108,11 +122,15 @@ struct logger_ctl {
 	char *port;
 	int socket_type;
 	size_t max_message_size;
+	struct list_head user_sds;	/* user defined rfc5424 structured data */
+	struct list_head reserved_sds;	/* standard rfc5424 structured data */
+
 	void (*syslogfp)(struct logger_ctl *ctl);
+
 	unsigned int
 			unix_socket_errors:1,	/* whether to report or not errors */
 			noact:1,		/* do not write to sockets */
-			prio_prefix:1,		/* read priority from intput */
+			prio_prefix:1,		/* read priority from input */
 			stderr_printout:1,	/* output message to stderr */
 			rfc5424_time:1,		/* include time stamp */
 			rfc5424_tq:1,		/* include time quality markup */
@@ -165,9 +183,9 @@ static inline pid_t logger_getpid(void)
 #endif
 
 
-static int decode(const char *name, CODE *codetab)
+static int decode(const char *name, const CODE *codetab)
 {
-	register CODE *c;
+	register const CODE *c;
 
 	if (name == NULL || *name == '\0')
 		return -1;
@@ -213,9 +231,9 @@ static int pencode(char *s)
 	return ((level & LOG_PRIMASK) | (facility & LOG_FACMASK));
 }
 
-static int unix_socket(struct logger_ctl *ctl, const char *path, const int socket_type)
+static int unix_socket(struct logger_ctl *ctl, const char *path, int *socket_type)
 {
-	int fd, i;
+	int fd, i, type = -1;
 	static struct sockaddr_un s_addr;	/* AF_UNIX address of local logger */
 
 	if (strlen(path) >= sizeof(s_addr.sun_path))
@@ -227,10 +245,14 @@ static int unix_socket(struct logger_ctl *ctl, const char *path, const int socke
 	for (i = 2; i; i--) {
 		int st = -1;
 
-		if (i == 2 && socket_type & TYPE_UDP)
+		if (i == 2 && *socket_type & TYPE_UDP) {
 			st = SOCK_DGRAM;
-		if (i == 1 && socket_type & TYPE_TCP)
+			type = TYPE_UDP;
+		}
+		if (i == 1 && *socket_type & TYPE_TCP) {
 			st = SOCK_STREAM;
+			type = TYPE_TCP;
+		}
 		if (st == -1 || (fd = socket(AF_UNIX, st, 0)) == -1)
 			continue;
 		if (connect(fd, (struct sockaddr *)&s_addr, sizeof(s_addr)) == -1) {
@@ -249,25 +271,30 @@ static int unix_socket(struct logger_ctl *ctl, const char *path, const int socke
 		ctl->noact = 1;
 		return -1;
 	}
+
+	/* replace ALL_TYPES with the real TYPE_* */
+	if (type > 0 && type != *socket_type)
+		*socket_type = type;
 	return fd;
 }
 
-static int inet_socket(const char *servername, const char *port,
-		       const int socket_type)
+static int inet_socket(const char *servername, const char *port, int *socket_type)
 {
-	int fd, errcode, i;
+	int fd, errcode, i, type = -1;
 	struct addrinfo hints, *res;
 	const char *p = port;
 
 	for (i = 2; i; i--) {
 		memset(&hints, 0, sizeof(hints));
-		if (i == 2 && socket_type & TYPE_UDP) {
+		if (i == 2 && *socket_type & TYPE_UDP) {
 			hints.ai_socktype = SOCK_DGRAM;
+			type = TYPE_UDP;
 			if (port == NULL)
 				p = "syslog";
 		}
-		if (i == 1 && socket_type & TYPE_TCP) {
+		if (i == 1 && *socket_type & TYPE_TCP) {
 			hints.ai_socktype = SOCK_STREAM;
+			type = TYPE_TCP;
 			if (port == NULL)
 				p = "syslog-conn";
 		}
@@ -295,6 +322,9 @@ static int inet_socket(const char *servername, const char *port,
 	if (i == 0)
 		errx(EXIT_FAILURE, _("failed to connect to %s port %s"), servername, p);
 
+	/* replace ALL_TYPES with the real TYPE_* */
+	if (type > 0 && type != *socket_type)
+		*socket_type = type;
 	return fd;
 }
 
@@ -311,11 +341,10 @@ static int journald_entry(struct logger_ctl *ctl, FILE *fp)
 	for (lines = 0; /* nothing */ ; lines++) {
 		buf = NULL;
 		sz = getline(&buf, &dummy, fp);
-		if (sz == -1)
+		if (sz == -1 ||
+		   (sz = rtrim_whitespace((unsigned char *) buf)) == 0) {
+			free(buf);
 			break;
-		if (0 < sz && buf[sz - 1] == '\n') {
-			sz--;
-			buf[sz] = '\0';
 		}
 		if (lines == vectors) {
 			vectors *= 2;
@@ -374,6 +403,22 @@ static const char *rfc3164_current_time(void)
 	return time;
 }
 
+#define next_iovec(ary, idx) __extension__ ({		\
+		assert(ARRAY_SIZE(ary) > (size_t)idx);	\
+		assert(idx >= 0);			\
+		&ary[idx++];				\
+})
+
+#define iovec_add_string(ary, idx, str, len)		\
+	do {						\
+		struct iovec *v = next_iovec(ary, idx);	\
+		v->iov_base = (void *) str;		\
+		v->iov_len = len ? len : strlen(str);	\
+	} while (0)
+
+#define iovec_memcmp(ary, idx, str, len)		\
+		memcmp((ary)[(idx) - 1].iov_base, str, len)
+
 /* writes generated buffer to desired destination. For TCP syslog,
  * we use RFC6587 octet-stuffing (unless octet-counting is selected).
  * This is not great, but doing full blown RFC5425 (TLS) looks like
@@ -382,28 +427,75 @@ static const char *rfc3164_current_time(void)
  */
 static void write_output(const struct logger_ctl *ctl, const char *const msg)
 {
-	char *buf;
-	const size_t len = ctl->octet_count ?
-		xasprintf(&buf, "%zu %s%s", strlen(ctl->hdr)+strlen(msg), ctl->hdr, msg):
-		xasprintf(&buf, "%s%s", ctl->hdr, msg);
+	struct iovec iov[4];
+	int iovlen = 0;
+	char *octet = NULL;
+
+	/* 1) octen count */
+	if (ctl->octet_count) {
+		size_t len = xasprintf(&octet, "%zu ", strlen(ctl->hdr) + strlen(msg));
+		iovec_add_string(iov, iovlen, octet, len);
+	}
+
+	/* 2) header */
+	iovec_add_string(iov, iovlen, ctl->hdr, 0);
+
+	/* 3) message */
+	iovec_add_string(iov, iovlen, msg, 0);
 
 	if (!ctl->noact) {
-		if (write_all(ctl->fd, buf, len) < 0)
-			warn(_("write failed"));
-		else if ((ctl->socket_type == TYPE_TCP) && !ctl->octet_count) {
-			/* using an additional write seems like the best compromise:
-			 * - writev() is not yet supported by framework
-			 * - adding the \n to the buffer in formatters violates layers
-			 * - adding \n after the fact requires memory copy
-			 * - logger is not a high-performance app
-			 */
-			if (write_all(ctl->fd, "\n", 1) < 0)
-				warn(_("write failed"));
+		struct msghdr message = { 0 };
+#ifdef SCM_CREDENTIALS
+		struct cmsghdr *cmhp;
+		struct ucred *cred;
+		union {
+			struct cmsghdr cmh;
+			char   control[CMSG_SPACE(sizeof(struct ucred))];
+		} cbuf;
+#endif
+
+		/* 4) add extra \n to make sure message is terminated */
+		if ((ctl->socket_type == TYPE_TCP) && !ctl->octet_count)
+			iovec_add_string(iov, iovlen, "\n", 1);
+
+		message.msg_iov = iov;
+		message.msg_iovlen = iovlen;
+
+#ifdef SCM_CREDENTIALS
+		/* syslog/journald may follow local socket credentials rather
+		 * than in the message PID. If we use --id as root than we can
+		 * force kernel to accept another valid PID than the real logger(1)
+		 * PID.
+		 */
+		if (ctl->pid && !ctl->server && ctl->pid != getpid()
+		    && geteuid() == 0 && kill(ctl->pid, 0) == 0) {
+
+			message.msg_control = cbuf.control;
+			message.msg_controllen = CMSG_SPACE(sizeof(struct ucred));
+
+			cmhp = CMSG_FIRSTHDR(&message);
+			cmhp->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+			cmhp->cmsg_level = SOL_SOCKET;
+			cmhp->cmsg_type = SCM_CREDENTIALS;
+			cred = (struct ucred *) CMSG_DATA(cmhp);
+
+			cred->pid = ctl->pid;
 		}
+#endif
+
+		if (sendmsg(ctl->fd, &message, 0) < 0)
+			warn(_("send message failed"));
 	}
-	if (ctl->stderr_printout)
-		fprintf(stderr, "%s\n", buf);
-	free(buf);
+
+	if (ctl->stderr_printout) {
+		/* make sure it's terminated for stderr */
+		if (iovec_memcmp(iov, iovlen, "\n", 1) != 0)
+			iovec_add_string(iov, iovlen, "\n", 1);
+
+		ignore_result( writev(STDERR_FILENO, iov, iovlen) );
+	}
+
+	free(octet);
 }
 
 #define NILVALUE "-"
@@ -430,7 +522,177 @@ static void syslog_rfc3164_header(struct logger_ctl *const ctl)
 	free(hostname);
 }
 
-/* Some field mappings may be controversal, thus I give the reason
+static inline struct list_head *get_user_structured_data(struct logger_ctl *ctl)
+{
+	return &ctl->user_sds;
+}
+
+static inline struct list_head *get_reserved_structured_data(struct logger_ctl *ctl)
+{
+	return &ctl->reserved_sds;
+}
+
+static int has_structured_data_id(struct list_head *ls, const char *id)
+{
+	struct list_head *p;
+
+	if (!ls || list_empty(ls))
+		return 0;
+
+	list_for_each(p, ls) {
+		struct structured_data *sd = list_entry(p, struct structured_data, sds);
+		if (sd->id && strcmp(sd->id, id) == 0)
+			return 1;
+	}
+
+	return 0;
+}
+
+static void add_structured_data_id(struct list_head *ls, const char *id)
+{
+	struct structured_data *sd;
+
+	assert(id);
+
+	if (has_structured_data_id(ls, id))
+		errx(EXIT_FAILURE, _("structured data ID '%s' is not unique"), id);
+
+	sd = xcalloc(1, sizeof(*sd));
+	INIT_LIST_HEAD(&sd->sds);
+	sd->id = xstrdup(id);
+
+	list_add_tail(&sd->sds, ls);
+}
+
+static void add_structured_data_param(struct list_head *ls, const char *param)
+{
+	struct structured_data *sd;
+
+	if (list_empty(ls))
+		errx(EXIT_FAILURE, _("--sd-id was not specified for --sd-param %s"), param);
+
+	assert(param);
+
+	sd = list_last_entry(ls, struct structured_data, sds);
+
+	if (strv_extend(&sd->params,  param))
+		err_oom();
+}
+
+static void add_structured_data_paramf(struct list_head *ls, const char *fmt, ...)
+{
+	struct structured_data *sd;
+	va_list ap;
+	int x;
+
+	assert(!list_empty(ls));
+	assert(fmt);
+
+	sd = list_last_entry(ls, struct structured_data, sds);
+	va_start(ap, fmt);
+	x = strv_extendv(&sd->params, fmt, ap);
+	va_end(ap);
+
+	if (x)
+		err_oom();
+}
+
+static char *strdup_structured_data(struct structured_data *sd)
+{
+	char *res, *tmp;
+
+	if (strv_isempty(sd->params))
+		return NULL;
+
+	xasprintf(&res, "[%s %s]", sd->id,
+			(tmp = strv_join(sd->params, " ")));
+	free(tmp);
+	return res;
+}
+
+static char *strdup_structured_data_list(struct list_head *ls)
+{
+	struct list_head *p;
+	char *res = NULL;
+
+	list_for_each(p, ls) {
+		struct structured_data *sd = list_entry(p, struct structured_data, sds);
+		char *one = strdup_structured_data(sd);
+		char *tmp = res;
+
+		if (!one)
+			continue;
+		res = strappend(tmp, one);
+		free(tmp);
+		free(one);
+	}
+
+	return res;
+}
+
+static char *get_structured_data_string(struct logger_ctl *ctl)
+{
+	char *sys = NULL, *usr = NULL, *res;
+
+	if (!list_empty(&ctl->reserved_sds))
+		sys = strdup_structured_data_list(&ctl->reserved_sds);
+	if (!list_empty(&ctl->user_sds))
+		usr = strdup_structured_data_list(&ctl->user_sds);
+
+	if (sys && usr) {
+		res = strappend(sys, usr);
+		free(sys);
+		free(usr);
+	} else
+		res = sys ? sys : usr;
+
+	return res;
+}
+
+static int valid_structured_data_param(const char *str)
+{
+	char *eq  = strchr(str, '='),
+	     *qm1 = strchr(str, '"'),
+	     *qm2 = qm1 ? strchr(qm1 + 1, '"') : NULL;
+
+	if (!eq || !qm1 || !qm2)		/* something is missing */
+		return 0;
+
+	/* foo="bar" */
+	return eq > str && eq < qm1 && eq + 1 == qm1 && qm1 < qm2 && *(qm2 + 1) == '\0';
+}
+
+/* SD-ID format:
+ *	name@<private enterprise number>, e.g., "ourSDID@32473"
+ */
+static int valid_structured_data_id(const char *str)
+{
+	char *at = strchr(str, '@');
+	const char *p;
+
+	/* standardized IDs without @<digits> */
+	if (!at && (strcmp(str, "timeQuality") == 0 ||
+		    strcmp(str, "origin") == 0 ||
+		    strcmp(str, "meta") == 0))
+		return 1;
+
+	if (!at || at == str || !*(at + 1))
+		return 0;
+	if (!isdigit_string(at + 1))
+		return 0;
+
+	/* check for forbidden chars in the <name> */
+	for (p = str; p < at; p++) {
+		if (*p == '[' || *p == '=' || *p == '"' || *p == '@')
+			return 0;
+		if (isblank((unsigned int) *p) || iscntrl((unsigned int) *p))
+			return 0;
+	}
+	return 1;
+}
+
+
+/* Some field mappings may be controversial, thus I give the reason
  * why this specific mapping was used:
  * APP-NAME <-- tag
  *    Some may argue that "logger" is a better fit, but we think
@@ -457,7 +719,8 @@ static void syslog_rfc5424_header(struct logger_ctl *const ctl)
 	char *const app_name = ctl->tag;
 	char *procid;
 	char *const msgid = xstrdup(ctl->msgid ? ctl->msgid : NILVALUE);
-	char *structured_data;
+	char *structured = NULL;
+	struct list_head *sd;
 
 	if (ctl->fd < 0)
 		return;
@@ -500,20 +763,29 @@ static void syslog_rfc5424_header(struct logger_ctl *const ctl)
 	else
 		procid = xstrdup(NILVALUE);
 
-	if (ctl->rfc5424_tq) {
+	sd = get_reserved_structured_data(ctl);
+
+	/* time quality structured data (maybe overwritten by --sd-id timeQuality) */
+	if (ctl->rfc5424_tq && !has_structured_data_id(sd, "timeQuality")) {
+
+		add_structured_data_id(sd, "timeQuality");
+		add_structured_data_param(sd, "tzKnown=\"1\"");
+
 #ifdef HAVE_NTP_GETTIME
 		struct ntptimeval ntptv;
 
-		if (ntp_gettime(&ntptv) == TIME_OK)
-			xasprintf(&structured_data,
-				 "[timeQuality tzKnown=\"1\" isSynced=\"1\" syncAccuracy=\"%ld\"]",
-				 ntptv.maxerror);
-		else
+		if (ntp_gettime(&ntptv) == TIME_OK) {
+			add_structured_data_param(sd, "isSynced=\"1\"");
+			add_structured_data_paramf(sd, "syncAccuracy=\"%ld\"", ntptv.maxerror);
+		} else
 #endif
-			xasprintf(&structured_data,
-				 "[timeQuality tzKnown=\"1\" isSynced=\"0\"]");
-	} else
-		structured_data = xstrdup(NILVALUE);
+			add_structured_data_paramf(sd, "isSynced=\"0\"");
+	}
+
+	/* convert all structured data to string */
+	structured = get_structured_data_string(ctl);
+	if (!structured)
+		structured = xstrdup(NILVALUE);
 
 	xasprintf(&ctl->hdr, "<%d>1 %s %s %s %s %s %s ",
 		ctl->pri,
@@ -522,21 +794,21 @@ static void syslog_rfc5424_header(struct logger_ctl *const ctl)
 		app_name,
 		procid,
 		msgid,
-		structured_data);
+		structured);
 
 	free(time);
 	free(hostname);
 	/* app_name points to ctl->tag, do NOT free! */
 	free(procid);
 	free(msgid);
-	free(structured_data);
+	free(structured);
 }
 
-static void parse_rfc5424_flags(struct logger_ctl *ctl, char *optarg)
+static void parse_rfc5424_flags(struct logger_ctl *ctl, char *s)
 {
 	char *in, *tok;
 
-	in = optarg;
+	in = s;
 	while ((tok = strtok(in, ","))) {
 		in = NULL;
 		if (!strcmp(tok, "notime")) {
@@ -551,15 +823,15 @@ static void parse_rfc5424_flags(struct logger_ctl *ctl, char *optarg)
 	}
 }
 
-static int parse_unix_socket_errors_flags(char *optarg)
+static int parse_unix_socket_errors_flags(char *s)
 {
-	if (!strcmp(optarg, "off"))
+	if (!strcmp(s, "off"))
 		return AF_UNIX_ERRORS_OFF;
-	if (!strcmp(optarg, "on"))
+	if (!strcmp(s, "on"))
 		return AF_UNIX_ERRORS_ON;
-	if (!strcmp(optarg, "auto"))
+	if (!strcmp(s, "auto"))
 		return AF_UNIX_ERRORS_AUTO;
-	warnx(_("invalid argument: %s: using automatic errors"), optarg);
+	warnx(_("invalid argument: %s: using automatic errors"), s);
 	return AF_UNIX_ERRORS_AUTO;
 }
 
@@ -585,14 +857,14 @@ static void generate_syslog_header(struct logger_ctl *const ctl)
 static void logger_open(struct logger_ctl *ctl)
 {
 	if (ctl->server) {
-		ctl->fd = inet_socket(ctl->server, ctl->port, ctl->socket_type);
+		ctl->fd = inet_socket(ctl->server, ctl->port, &ctl->socket_type);
 		if (!ctl->syslogfp)
 			ctl->syslogfp = syslog_rfc5424_header;
 	} else {
 		if (!ctl->unix_socket)
 			ctl->unix_socket = _PATH_DEVLOG;
 
-		ctl->fd = unix_socket(ctl, ctl->unix_socket, ctl->socket_type);
+		ctl->fd = unix_socket(ctl, ctl->unix_socket, &ctl->socket_type);
 		if (!ctl->syslogfp)
 			ctl->syslogfp = syslog_local_header;
 	}
@@ -636,6 +908,11 @@ static void logger_command_line(const struct logger_ctl *ctl, char **argv)
 
 static void logger_stdin(struct logger_ctl *ctl)
 {
+	/* note: we re-generate the the syslog header for each log message to
+	 * update header timestamps and to reflect possible priority changes.
+	 * The initial header is generated by logger_open().
+	 */
+	int has_header = 1;
 	int default_priority = ctl->pri;
 	int last_pri = default_priority;
 	size_t max_usrmsg_size = ctl->max_message_size - strlen(ctl->hdr);
@@ -647,32 +924,32 @@ static void logger_stdin(struct logger_ctl *ctl)
 	c = getchar();
 	while (c != EOF) {
 		i = 0;
-		if (ctl->prio_prefix) {
-			if (c == '<') {
-				pri = 0;
+		if (ctl->prio_prefix && c == '<') {
+			pri = 0;
+			buf[i++] = c;
+			while (isdigit(c = getchar()) && pri <= 191) {
 				buf[i++] = c;
-				while (isdigit(c = getchar()) && pri <= 191) {
-					buf[i++] = c;
-					pri = pri * 10 + c - '0';
-				}
-				if (c != EOF && c != '\n')
-					buf[i++] = c;
-				if (c == '>' && 0 <= pri && pri <= 191) { /* valid RFC PRI values */
-					i = 0;
-					if (pri < 8)
-						pri |= 8; /* kern facility is forbidden */
-					ctl->pri = pri;
-				} else
-					ctl->pri = default_priority;
-
-				if (ctl->pri != last_pri) {
-					generate_syslog_header(ctl);
-					max_usrmsg_size = ctl->max_message_size - strlen(ctl->hdr);
-					last_pri = ctl->pri;
-				}
-				if (c != EOF && c != '\n')
-					c = getchar();
+				pri = pri * 10 + c - '0';
 			}
+			if (c != EOF && c != '\n')
+				buf[i++] = c;
+			if (c == '>' && 0 <= pri && pri <= 191) {
+				/* valid RFC PRI values */
+				i = 0;
+				if (pri < 8)	/* kern facility is forbidden */
+					pri |= 8;
+				ctl->pri = pri;
+			} else
+				ctl->pri = default_priority;
+
+			if (ctl->pri != last_pri) {
+				has_header = 0;
+				max_usrmsg_size =
+				    ctl->max_message_size - strlen(ctl->hdr);
+				last_pri = ctl->pri;
+			}
+			if (c != EOF && c != '\n')
+				c = getchar();
 		}
 
 		while (c != EOF && c != '\n' && i < max_usrmsg_size) {
@@ -681,8 +958,12 @@ static void logger_stdin(struct logger_ctl *ctl)
 		}
 		buf[i] = '\0';
 
-		if (i > 0 || !ctl->skip_empty_lines)
+		if (i > 0 || !ctl->skip_empty_lines) {
+			if (!has_header)
+				generate_syslog_header(ctl);
 			write_output(ctl, buf);
+			has_header = 0;
+		}
 
 		if (c == '\n')	/* discard line terminator */
 			c = getchar();
@@ -717,12 +998,14 @@ static void __attribute__ ((__noreturn__)) usage(FILE *out)
 	fputs(_(" -S, --size <size>        maximum size for a single message\n"), out);
 	fputs(_(" -t, --tag <tag>          mark every line with this tag\n"), out);
 	fputs(_(" -n, --server <name>      write to this remote syslog server\n"), out);
-	fputs(_(" -P, --port <number>      use this UDP port\n"), out);
+	fputs(_(" -P, --port <port>        use this port for UDP or TCP connection\n"), out);
 	fputs(_(" -T, --tcp                use TCP only\n"), out);
 	fputs(_(" -d, --udp                use UDP only\n"), out);
 	fputs(_("     --rfc3164            use the obsolete BSD syslog protocol\n"), out);
 	fputs(_("     --rfc5424[=<snip>]   use the syslog protocol (the default for remote);\n"
 		"                            <snip> can be notime, or notq, and/or nohost\n"), out);
+	fputs(_("     --sd-id <id>         rfc5424 structured data ID\n"), out);
+	fputs(_("     --sd-param <data>    rfc5424 structured data name=value\n"), out);
 	fputs(_("     --msgid <msgid>      set rfc5424 message id field\n"), out);
 	fputs(_(" -u, --socket <socket>    write to this Unix socket\n"), out);
 	fputs(_("     --socket-errors[=<on|off|auto>]\n"
@@ -794,6 +1077,8 @@ int main(int argc, char **argv)
 		{ "size",	   required_argument, 0, 'S'		   },
 		{ "msgid",	   required_argument, 0, OPT_MSGID	   },
 		{ "skip-empty",	   no_argument,	      0, 'e'		   },
+		{ "sd-id",         required_argument, 0, OPT_STRUCTURED_DATA_ID          },
+		{ "sd-param",      required_argument, 0, OPT_STRUCTURED_DATA_PARAM       },
 #ifdef HAVE_LIBSYSTEMD
 		{ "journald",	   optional_argument, 0, OPT_JOURNALD	   },
 #endif
@@ -804,6 +1089,9 @@ int main(int argc, char **argv)
 	bindtextdomain(PACKAGE, LOCALEDIR);
 	textdomain(PACKAGE);
 	atexit(close_stdout);
+
+	INIT_LIST_HEAD(&ctl.user_sds);
+	INIT_LIST_HEAD(&ctl.reserved_sds);
 
 	while ((ch = getopt_long(argc, argv, "ef:ip:S:st:u:dTn:P:Vh",
 					    longopts, NULL)) != -1) {
@@ -898,6 +1186,16 @@ int main(int argc, char **argv)
 		case OPT_NOACT:
 			ctl.noact = 1;
 			break;
+		case OPT_STRUCTURED_DATA_ID:
+			if (!valid_structured_data_id(optarg))
+				errx(EXIT_FAILURE, _("invalid structured data ID: '%s'"), optarg);
+			add_structured_data_id(get_user_structured_data(&ctl), optarg);
+			break;
+		case OPT_STRUCTURED_DATA_PARAM:
+			if (!valid_structured_data_param(optarg))
+				errx(EXIT_FAILURE, _("invalid structured data parameter: '%s'"), optarg);
+			add_structured_data_param(get_user_structured_data(&ctl), optarg);
+			break;
 		case '?':
 		default:
 			usage(stderr);
@@ -917,6 +1215,11 @@ int main(int argc, char **argv)
 		return EXIT_SUCCESS;
 	}
 #endif
+
+	/* user overwrites build-in SD-ELEMENT */
+	if (has_structured_data_id(get_user_structured_data(&ctl), "timeQuality"))
+		ctl.rfc5424_tq = 0;
+
 	switch (unix_socket_errors_mode) {
 	case AF_UNIX_ERRORS_OFF:
 		ctl.unix_socket_errors = 0;

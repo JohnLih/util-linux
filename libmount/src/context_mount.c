@@ -112,7 +112,7 @@ static int init_propagation(struct libmnt_context *cxt)
  *
  * Note that we don't remove "ro" from the first syscall (kernel silently
  * ignores this flags for bind operation) -- maybe one day kernel will support
- * read-only binds in one step and then all will be done by the firts mount(2) and the
+ * read-only binds in one step and then all will be done by the first mount(2) and the
  * second remount will be noop...
  */
 static int init_robind(struct libmnt_context *cxt)
@@ -378,7 +378,7 @@ static int generate_helper_optstr(struct libmnt_context *cxt, char **optstr)
 		 * However, if you call mount.<type> as root, then the helper follows
 		 * the command line. If there is (for example) "user,exec" in fstab,
 		 * then we have to manually append the "exec" back to the options
-		 * string, bacause there is nothing like MS_EXEC (we only have
+		 * string, because there is nothing like MS_EXEC (we only have
 		 * MS_NOEXEC in mount flags and we don't care about the original
 		 * mount string in libmount for VFS options).
 		 */
@@ -566,7 +566,6 @@ int mnt_context_mount_setopt(struct libmnt_context *cxt, int c, char *arg)
 		break;
 	default:
 		return 1;
-		break;
 	}
 
 	return rc;

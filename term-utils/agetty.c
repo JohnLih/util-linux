@@ -44,6 +44,12 @@
 #include "c.h"
 #include "widechar.h"
 #include "ttyutils.h"
+#include "color-names.h"
+#include "env.h"
+
+#ifdef USE_PLYMOUTH_SUPPORT
+# include "plymouth-ctrl.h"
+#endif
 
 #ifdef HAVE_SYS_PARAM_H
 # include <sys/param.h>
@@ -137,9 +143,6 @@ static int inotify_fd = AGETTY_RELOAD_FDNONE;
 static int netlink_fd = AGETTY_RELOAD_FDNONE;
 #endif
 
-#define AGETTY_PLYMOUTH		"/usr/bin/plymouth"
-#define AGETTY_PLYMOUTH_FDFILE	"/dev/null"
-
 /*
  * When multiple baud rates are specified on the command line, the first one
  * we will try is the first one specified.
@@ -151,7 +154,7 @@ static int netlink_fd = AGETTY_RELOAD_FDNONE;
 
 struct options {
 	int flags;			/* toggle switches, see below */
-	int timeout;			/* time-out period */
+	unsigned int timeout;			/* time-out period */
 	char *autolog;			/* login the user automatically */
 	char *chdir;			/* Chdir before the login */
 	char *chroot;			/* Chroot before the login */
@@ -165,7 +168,7 @@ struct options {
 	char *erasechars;		/* string with erase chars */
 	char *killchars;		/* string with kill chars */
 	char *osrelease;		/* /etc/os-release data */
-	int delay;			/* Sleep seconds before prompt */
+	unsigned int delay;			/* Sleep seconds before prompt */
 	int nice;			/* Run login with this priority */
 	int numspeed;			/* number of baud rates to try */
 	int clocal;			/* CLOCAL_MODE_* */
@@ -308,7 +311,6 @@ static void log_warn (const char *, ...)
 static ssize_t append(char *dest, size_t len, const char  *sep, const char *src);
 static void check_username (const char* nm);
 static void login_options_to_argv(char *argv[], int *argc, char *str, char *username);
-static int plymouth_command(const char* arg);
 static void reload_agettys(void);
 
 /* Fake hostname for ut_host specified on command line. */
@@ -388,7 +390,7 @@ int main(int argc, char **argv)
 
 	tcsetpgrp(STDIN_FILENO, getpid());
 
-	/* Default is to follow the current line speend and then default to 9600 */
+	/* Default is to follow the current line speed and then default to 9600 */
 	if ((options.flags & F_VCONSOLE) == 0 && options.numspeed == 0) {
 		options.speeds[options.numspeed++] = bcode("9600");
 		options.flags |= F_KEEPSPEED;
@@ -420,7 +422,7 @@ int main(int argc, char **argv)
 
 	/* Set the optional timer. */
 	if (options.timeout)
-		alarm((unsigned) options.timeout);
+		alarm(options.timeout);
 
 	/* Optionally wait for CR or LF before writing /etc/issue */
 	if (serial_tty_option(&options, F_WAITCRLF)) {
@@ -501,21 +503,16 @@ int main(int argc, char **argv)
 
 	login_argv[login_argc] = NULL;	/* last login argv */
 
-	if (options.chroot) {
-		if (chroot(options.chroot) < 0)
-			log_err(_("%s: can't change root directory %s: %m"),
-				options.tty, options.chroot);
-	}
-	if (options.chdir) {
-		if (chdir(options.chdir) < 0)
-			log_err(_("%s: can't change working directory %s: %m"),
-				options.tty, options.chdir);
-	}
-	if (options.nice) {
-		if (nice(options.nice) < 0)
-			log_warn(_("%s: can't change process priority: %m"),
-				options.tty);
-	}
+	if (options.chroot && chroot(options.chroot) < 0)
+		log_err(_("%s: can't change root directory %s: %m"),
+			options.tty, options.chroot);
+	if (options.chdir && chdir(options.chdir) < 0)
+		log_err(_("%s: can't change working directory %s: %m"),
+			options.tty, options.chdir);
+	if (options.nice && nice(options.nice) < 0)
+		log_warn(_("%s: can't change process priority: %m"),
+			 options.tty);
+
 	free(options.osrelease);
 #ifdef DEBUGGING
 	if (close_stream(dbf) != 0)
@@ -558,7 +555,7 @@ static char *replace_u(char *str, char *username)
 			log_err(_("failed to allocate memory: %m"));
 
 		if (p != str) {
-			/* copy chars befor \u */
+			/* copy chars before \u */
 			memcpy(tp, str, p - str);
 			tp += p - str;
 		}
@@ -680,7 +677,7 @@ static void parse_args(int argc, char **argv, struct options *op)
 			op->chdir = optarg;
 			break;
 		case 'd':
-			op->delay = atoi(optarg);
+			op->delay = strtou32_or_err(optarg,  _("invalid delay argument"));
 			break;
 		case 'E':
 			op->flags |= F_REMOTE;
@@ -738,7 +735,7 @@ static void parse_args(int argc, char **argv, struct options *op)
 			op->flags |= F_LOGINPAUSE;
 			break;
 		case 'P':
-			op->nice = atoi(optarg);
+			op->nice = strtos32_or_err(optarg,  _("invalid nice argument"));
 			break;
 		case 'r':
 			op->chroot = optarg;
@@ -750,8 +747,7 @@ static void parse_args(int argc, char **argv, struct options *op)
 			op->flags |= F_KEEPSPEED;
 			break;
 		case 't':
-			if ((op->timeout = atoi(optarg)) <= 0)
-				log_err(_("bad timeout value: %s"), optarg);
+			op->timeout = strtou32_or_err(optarg,  _("invalid timeout argument"));
 			break;
 		case 'U':
 			op->flags |= F_LCUC;
@@ -868,15 +864,20 @@ static void parse_args(int argc, char **argv, struct options *op)
 static void parse_speeds(struct options *op, char *arg)
 {
 	char *cp;
+	char *str = strdup(arg);
 
-	debug("entered parse_speeds\n");
-	for (cp = strtok(arg, ","); cp != NULL; cp = strtok((char *)0, ",")) {
+	if (!str)
+		log_err(_("failed to allocate memory: %m"));
+
+	debug("entered parse_speeds:\n");
+	for (cp = strtok(str, ","); cp != NULL; cp = strtok((char *)0, ",")) {
 		if ((op->speeds[op->numspeed++] = bcode(cp)) <= 0)
 			log_err(_("bad speed: %s"), cp);
 		if (op->numspeed >= MAX_SPEED)
 			log_err(_("too many alternate speeds"));
 	}
 	debug("exiting parsespeeds\n");
+	free(str);
 }
 
 #ifdef	SYSV_STYLE
@@ -1000,8 +1001,12 @@ static void open_tty(char *tty, struct termios *tp, struct options *op)
 		if ((gr = getgrnam("tty")))
 			gid = gr->gr_gid;
 
-		if (((len = snprintf(buf, sizeof(buf), "/dev/%s", tty)) >=
-		     (int)sizeof(buf)) || (len < 0))
+		len = snprintf(buf, sizeof(buf), "/dev/%s", tty);
+		if (len < 0 || (size_t)len >= sizeof(buf))
+			log_err(_("/dev/%s: cannot open as standard input: %m"), tty);
+
+		/* Open the tty as standard input. */
+		if ((fd = open(buf, O_RDWR|O_NOCTTY|O_NONBLOCK, 0)) < 0)
 			log_err(_("/dev/%s: cannot open as standard input: %m"), tty);
 
 		/*
@@ -1010,16 +1015,12 @@ static void open_tty(char *tty, struct termios *tp, struct options *op)
 		 * Linux login(1) will change tty permissions. Use root owner and group
 		 * with permission -rw------- for the period between getty and login.
 		 */
-		if (chown(buf, 0, gid) || chmod(buf, (gid ? 0620 : 0600))) {
+		if (fchown(fd, 0, gid) || fchmod(fd, (gid ? 0620 : 0600))) {
 			if (errno == EROFS)
 				log_warn("%s: %m", buf);
 			else
 				log_err("%s: %m", buf);
 		}
-
-		/* Open the tty as standard input. */
-		if ((fd = open(buf, O_RDWR|O_NOCTTY|O_NONBLOCK, 0)) < 0)
-			log_err(_("/dev/%s: cannot open as standard input: %m"), tty);
 
 		/* Sanity checks... */
 		if (fstat(fd, &st) < 0)
@@ -1043,7 +1044,7 @@ static void open_tty(char *tty, struct termios *tp, struct options *op)
 				debug("TIOCNOTTY ioctl failed\n");
 
 			/*
-			 * Let's close all file decriptors before vhangup
+			 * Let's close all file descriptors before vhangup
 			 * https://lkml.org/lkml/2012/6/5/145
 			 */
 			close(fd);
@@ -1155,7 +1156,8 @@ static void open_tty(char *tty, struct termios *tp, struct options *op)
 			op->term = DEFAULT_STERM;
 	}
 
-	setenv("TERM", op->term, 1);
+	if (setenv("TERM", op->term, 1) != 0)
+		log_err(_("failed to set the %s environment variable"), "TERM");
 }
 
 /* Initialize termios settings. */
@@ -1178,10 +1180,11 @@ static void termio_init(struct options *op, struct termios *tp)
 {
 	speed_t ispeed, ospeed;
 	struct winsize ws;
+#ifdef USE_PLYMOUTH_SUPPORT
 	struct termios lock;
-#ifdef TIOCGLCKTRMIOS
-	int i =  (plymouth_command("--ping") == 0) ? 30 : 0;
-
+	int i =  (plymouth_command(MAGIC_PING) == 0) ? PLYMOUTH_TERMIOS_FLAGS_DELAY : 0;
+	if (i)
+		plymouth_command(MAGIC_QUIT);
 	while (i-- > 0) {
 		/*
 		 * Even with TTYReset=no it seems with systemd or plymouth
@@ -1194,8 +1197,6 @@ static void termio_init(struct options *op, struct termios *tp)
 		if (!lock.c_iflag && !lock.c_oflag && !lock.c_cflag && !lock.c_lflag)
 			break;
 		debug("termios locked\n");
-		if (i == 15 && plymouth_command("quit") != 0)
-			break;
 		sleep(1);
 	}
 	memset(&lock, 0, sizeof(struct termios));
@@ -1269,7 +1270,7 @@ static void termio_init(struct options *op, struct termios *tp)
 
 	/*
 	 * Note that the speed is stored in the c_cflag termios field, so we have
-	 * set the speed always when the cflag se reseted.
+	 * set the speed always when the cflag is reset.
 	 */
 	cfsetispeed(tp, ispeed);
 	cfsetospeed(tp, ospeed);
@@ -1425,7 +1426,7 @@ static char *xgetdomainname(void)
 {
 #ifdef HAVE_GETDOMAINNAME
 	char *name;
-	size_t sz = get_hostname_max() + 1;
+	const size_t sz = get_hostname_max() + 1;
 
 	name = malloc(sizeof(char) * sz);
 	if (!name)
@@ -1437,8 +1438,9 @@ static char *xgetdomainname(void)
 	}
 	name[sz - 1] = '\0';
 	return name;
-#endif
+#else
 	return NULL;
+#endif
 }
 
 static char *read_os_release(struct options *op, const char *varname)
@@ -1637,16 +1639,22 @@ static int wait_for_term_input(int fd)
 	}
 
 	while (1) {
+		int nfds = fd;
+
 		FD_ZERO(&rfds);
 		FD_SET(fd, &rfds);
 
-		if (inotify_fd >= 0)
+		if (inotify_fd >= 0) {
 			FD_SET(inotify_fd, &rfds);
-		if (netlink_fd >= 0)
+			nfds = max(nfds, inotify_fd);
+		}
+		if (netlink_fd >= 0) {
 			FD_SET(netlink_fd, &rfds);
+			nfds = max(nfds, netlink_fd);
+		}
 
 		/* If waiting fails, just fall through, presumably reading input will fail */
-		if (select(max(fd, inotify_fd) + 1, &rfds, NULL, NULL, NULL) < 0)
+		if (select(nfds + 1, &rfds, NULL, NULL, NULL) < 0)
 			return 1;
 
 		if (FD_ISSET(fd, &rfds)) {
@@ -1719,7 +1727,9 @@ static void print_issue_file(struct options *op, struct termios *tp)
 /* Show login prompt, optionally preceded by /etc/issue contents. */
 static void do_prompt(struct options *op, struct termios *tp)
 {
+#ifdef AGETTY_RELOAD
 again:
+#endif
 	print_issue_file(op, tp);
 
 	if (op->flags & F_LOGINPAUSE) {
@@ -1963,7 +1973,7 @@ static char *get_logname(struct options *op, struct termios *tp, struct chardata
 		if (len < 0)
 			log_err(_("%s: invalid character conversion for login name"), op->tty);
 
-		wcs = (wchar_t *) malloc((len + 1) * sizeof(wchar_t));
+		wcs = malloc((len + 1) * sizeof(wchar_t));
 		if (!wcs)
 			log_err(_("failed to allocate memory: %m"));
 
@@ -2330,22 +2340,37 @@ static void output_special_char(unsigned char c, struct options *op,
 {
 	struct utsname uts;
 
-	uname(&uts);
-
 	switch (c) {
+	case 'e':
+	{
+		char escname[UL_COLORNAME_MAXSZ];
+
+		if (get_escape_argument(fp, escname, sizeof(escname))) {
+			const char *esc = color_sequence_from_colorname(escname);
+			if (esc)
+				fputs(esc, stdout);
+		} else
+			fputs("\033", stdout);
+		break;
+	}
 	case 's':
+		uname(&uts);
 		printf("%s", uts.sysname);
 		break;
 	case 'n':
+		uname(&uts);
 		printf("%s", uts.nodename);
 		break;
 	case 'r':
+		uname(&uts);
 		printf("%s", uts.release);
 		break;
 	case 'v':
+		uname(&uts);
 		printf("%s", uts.version);
 		break;
 	case 'm':
+		uname(&uts);
 		printf("%s", uts.machine);
 		break;
 	case 'o':
@@ -2422,17 +2447,23 @@ static void output_special_char(unsigned char c, struct options *op,
 	{
 		char *var = NULL, varname[64];
 
-		if (get_escape_argument(fp, varname, sizeof(varname)))
+		/* \S{varname} */
+		if (get_escape_argument(fp, varname, sizeof(varname))) {
 			var = read_os_release(op, varname);
-		else if (!(var = read_os_release(op, "PRETTY_NAME")))
-			var = uts.sysname;
-		if (var) {
-			if (strcmp(varname, "ANSI_COLOR") == 0)
-				printf("\033[%sm", var);
-			else
-				printf("%s", var);
-			if (var != uts.sysname)
-				free(var);
+			if (var) {
+				if (strcmp(varname, "ANSI_COLOR") == 0)
+					printf("\033[%sm", var);
+				else
+					fputs(var, stdout);
+			}
+		/* \S */
+		} else if ((var = read_os_release(op, "PRETTY_NAME"))) {
+			fputs(var, stdout);
+
+		/* \S and PRETTY_NAME not found */
+		} else {
+			uname(&uts);
+			fputs(uts.sysname, stdout);
 		}
 		break;
 	}
@@ -2576,40 +2607,6 @@ static void check_username(const char* nm)
 err:
 	errno = EPERM;
 	log_err(_("checkname failed: %m"));
-}
-
-/*
- * For the case plymouth is found on this system
- */
-static int plymouth_command(const char* arg)
-{
-	static int has_plymouth = 1;
-	pid_t pid;
-
-	if (!has_plymouth)
-		return 127;
-
-	pid = fork();
-	if (!pid) {
-		int fd = open(AGETTY_PLYMOUTH_FDFILE, O_RDWR);
-
-		if (fd < 0)
-			err(EXIT_FAILURE,_("cannot open %s"),
-					AGETTY_PLYMOUTH_FDFILE);
-		dup2(fd, 0);
-		dup2(fd, 1);
-		dup2(fd, 2);
-		close(fd);
-		execl(AGETTY_PLYMOUTH, AGETTY_PLYMOUTH, arg, (char *) NULL);
-		exit(127);
-	} else if (pid > 0) {
-		int status;
-		waitpid(pid, &status, 0);
-		if (status == 127)
-			has_plymouth = 0;
-		return status;
-	}
-	return 1;
 }
 
 static void reload_agettys(void)

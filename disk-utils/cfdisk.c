@@ -23,10 +23,6 @@
 #include <sys/ioctl.h>
 #include <libfdisk.h>
 
-#ifdef HAVE_LIBBLKID
-# include <blkid.h>	/* keep it optional */
-#endif
-
 #ifdef HAVE_LIBMOUNT
 # include <libmount.h>	/* keep it optional for non-linux systems */
 #endif
@@ -64,16 +60,19 @@
 #include "debug.h"
 #include "list.h"
 
+static const char *default_disks[] = {
 #ifdef __GNU__
-# define DEFAULT_DEVICE "/dev/hd0"
-# define ALTERNATE_DEVICE "/dev/sd0"
+		"/dev/hd0",
+		"/dev/sd0",
 #elif defined(__FreeBSD__)
-# define DEFAULT_DEVICE "/dev/ad0"
-# define ALTERNATE_DEVICE "/dev/da0"
+		"/dev/ad0",
+		"/dev/da0",
 #else
-# define DEFAULT_DEVICE "/dev/sda"
-# define ALTERNATE_DEVICE "/dev/hda"
+		"/dev/sda",
+		"/dev/vda",
+		"/dev/hda",
 #endif
+};
 
 #define ARROW_CURSOR_STRING	">>  "
 #define ARROW_CURSOR_DUMMY	"    "
@@ -180,7 +179,7 @@ static struct cfdisk_menuitem main_menuitems[] = {
 	{ 'b', N_("Bootable"), N_("Toggle bootable flag of the current partition") },
 	{ 'd', N_("Delete"), N_("Delete the current partition") },
 	{ 'n', N_("New"), N_("Create new partition from free space") },
-	{ 'q', N_("Quit"), N_("Quit program without writing partition table") },
+	{ 'q', N_("Quit"), N_("Quit program without writing changes") },
 	{ 't', N_("Type"), N_("Change the partition type") },
 	{ 'h', N_("Help"), N_("Print help screen") },
 	{ 's', N_("Sort"), N_("Fix partitions order") },
@@ -354,6 +353,11 @@ static char *table_to_string(struct cfdisk *cf, struct fdisk_table *tb)
 	if (!table)
 		goto done;
 	scols_table_enable_maxout(table, 1);
+	scols_table_enable_nowrap(table, 1);
+
+#if !defined(HAVE_LIBNCURSESW) || !defined(HAVE_WIDECHAR)
+	scols_table_enable_ascii(table, 1);
+#endif
 
 	/* headers */
 	for (i = 0; i < cf->nfields; i++) {
@@ -497,23 +501,12 @@ static int lines_refresh(struct cfdisk *cf)
 	cf->lines = xcalloc(cf->nlines, sizeof(struct cfdisk_line));
 
 	for (p = cf->linesbuf, i = 0; p && i < cf->nlines; i++) {
-		char *begin = p;
-		size_t sz;
-
-		cf->lines[i].data = begin;
-		p = strchr(begin, '\n');
-		sz = p ? (size_t) (p - begin) : strlen(begin);
+		cf->lines[i].data = p;
+		p = strchr(p, '\n');
 		if (p) {
 			*p = '\0';
 			p++;
 		}
-		/* libsmartcols reduces columns width as much as possible to
-		 * fit terminal width, but for very small terminals it preffers
-		 * long lines rather than remove columns from output. This is fine
-		 * for normal utils, but it's problematic for ncurses -- so we
-		 * manually cut the end of the line to fit terminal width. */
-		if (sz + ARROW_CURSOR_WIDTH > ui_cols)
-			*(begin + (ui_cols - ARROW_CURSOR_WIDTH)) = '\0';
 		cf->lines[i].extra = scols_new_table();
 		scols_table_enable_noheadings(cf->lines[i].extra, 1);
 		scols_table_new_column(cf->lines[i].extra, NULL, 0, SCOLS_FL_RIGHT);
@@ -543,7 +536,7 @@ static int is_freespace(struct cfdisk *cf, size_t i)
 }
 
 /* converts libfdisk FDISK_ASKTYPE_MENU to cfdisk menu and returns user's
- * responseback to libfdisk
+ * response back to libfdisk
  */
 static int ask_menu(struct fdisk_ask *ask, struct cfdisk *cf)
 {
@@ -1319,39 +1312,19 @@ static void extra_prepare_data(struct cfdisk *cf)
 		free(data);
 	}
 
-#ifdef HAVE_LIBBLKID
-	if (fdisk_partition_has_start(pa) && fdisk_partition_has_size(pa)) {
-		int fd;
-		uintmax_t start, size;
-		blkid_probe pr = blkid_new_probe();
-
-		if (!pr)
-			goto done;
-
-		DBG(UI, ul_debug("blkid prober: %p", pr));
-
-		start = fdisk_partition_get_start(pa) * fdisk_get_sector_size(cf->cxt);
-		size = fdisk_partition_get_size(pa) * fdisk_get_sector_size(cf->cxt);
-		fd = fdisk_get_devfd(cf->cxt);
-
-		if (blkid_probe_set_device(pr, fd, start, size) == 0 &&
-		    blkid_do_fullprobe(pr) == 0) {
-			const char *bdata = NULL;
-
-			if (!blkid_probe_lookup_value(pr, "TYPE", &bdata, NULL))
-				extra_insert_pair(l, _("Filesystem:"), bdata);
-			if (!blkid_probe_lookup_value(pr, "LABEL", &bdata, NULL)) {
-				extra_insert_pair(l, _("Filesystem label:"), bdata);
-				devlabel = xstrdup(bdata);
-			}
-			if (!blkid_probe_lookup_value(pr, "UUID", &bdata, NULL)) {
-				extra_insert_pair(l, _("Filesystem UUID:"), bdata);
-				devuuid = xstrdup(bdata);
-			}
-		}
-		blkid_free_probe(pr);
+	if (!fdisk_partition_to_string(pa, cf->cxt, FDISK_FIELD_FSUUID, &data) && data) {
+		extra_insert_pair(l, _("Filesystem UUID:"), data);
+		free(data);
 	}
-#endif /* HAVE_LIBBLKID */
+
+	if (!fdisk_partition_to_string(pa, cf->cxt, FDISK_FIELD_FSLABEL, &data) && data) {
+		extra_insert_pair(l, _("Filesystem LABEL:"), data);
+		free(data);
+	}
+	if (!fdisk_partition_to_string(pa, cf->cxt, FDISK_FIELD_FSTYPE, &data) && data) {
+		extra_insert_pair(l, _("Filesystem:"), data);
+		free(data);
+	}
 
 #ifdef HAVE_LIBMOUNT
 	if (devuuid || devlabel) {
@@ -1362,7 +1335,6 @@ static void extra_prepare_data(struct cfdisk *cf)
 		}
 	}
 #endif /* HAVE_LIBMOUNT */
-done:
 	free(devlabel);
 	free(devuuid);
 }
@@ -2445,6 +2417,14 @@ static int ui_run(struct cfdisk *cf)
 	ui_cols = COLS;
 	DBG(UI, ul_debug("start cols=%zu, lines=%zu", ui_cols, ui_lines));
 
+	if (fdisk_get_collision(cf->cxt)) {
+		ui_warnx(_("Device already contains a %s signature; it will be removed by a write command."),
+				fdisk_get_collision(cf->cxt));
+		fdisk_enable_wipe(cf->cxt, 1);
+		ui_hint(_("Press a key to continue."));
+		getch();
+	}
+
 	if (!fdisk_has_label(cf->cxt) || cf->zero_start) {
 		rc = ui_create_label(cf);
 		if (rc < 0)
@@ -2567,7 +2547,7 @@ static void __attribute__ ((__noreturn__)) usage(FILE *out)
 
 int main(int argc, char *argv[])
 {
-	const char *diskpath;
+	const char *diskpath = NULL;
 	int rc, c, colormode = UL_COLORMODE_UNDEF;
 	struct cfdisk _cf = { .lines_idx = 0 },
 		      *cf = &_cf;
@@ -2616,18 +2596,25 @@ int main(int argc, char *argv[])
 
 	fdisk_set_ask(cf->cxt, ask_callback, (void *) cf);
 
-	if (optind == argc)
-		diskpath = access(DEFAULT_DEVICE, F_OK) == 0 ?
-					DEFAULT_DEVICE : ALTERNATE_DEVICE;
-	else
+	if (optind == argc) {
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(default_disks); i++) {
+			if (access(default_disks[i], F_OK) == 0) {
+				diskpath = default_disks[i];
+				break;
+			}
+		}
+		if (!diskpath)
+			diskpath = default_disks[0];	/* default, used for "cannot open" */
+	} else
 		diskpath = argv[optind];
 
 	rc = fdisk_assign_device(cf->cxt, diskpath, 0);
 	if (rc == -EACCES)
 		rc = fdisk_assign_device(cf->cxt, diskpath, 1);
 	if (rc != 0)
-		err(EXIT_FAILURE, _("cannot open %s"),
-				optind == argc ? DEFAULT_DEVICE : diskpath);
+		err(EXIT_FAILURE, _("cannot open %s"), diskpath);
 
 	/* Don't use err(), warn() from this point */
 	ui_init(cf);

@@ -41,10 +41,30 @@ cal \- display a calendar
 .B cal
 [options]
 .RI [[[ day ] " month" ] " year" ]
+.br
+.B cal
+[options]
+.RI <timestamp>
 .SH DESCRIPTION
 .B cal
 displays a simple calendar.  If no arguments are specified, the current
 month is displayed.
+.sp
+The \fImonth\fR may be specified as a number (1-12) or as a month name according
+to the current locales.
+.sp
+.B cal
+accepts special placeholders when parsing \fItimestamp\fR, "now" may be used to
+refer to the current time, "today", "yesterday", "tomorrow" refer to
+of the current day, the day before or the next day, respectively.
+.sp
+The relative date specifications are also accepted, in this case "+" is
+evaluated to the current time plus the specified time span. Correspondingly, a
+time span that is prefixed with "-" is evaluated to the current time minus the
+specified time span, for example '+2days'. Instead of prefixing the time span
+with "+" or "-", it may also be suffixed with a space and the word "left" or
+"ago" (for example '1 week ago').
+
 .SH OPTIONS
 .TP
 \fB\-1\fR, \fB\-\-one\fR
@@ -56,6 +76,9 @@ Display three months spanning the date.
 .TP
 \fB\-n , \-\-months\fR \fInumber\fR
 Display \fInumber\fR of months, starting from the month containing the date.
+.TP
+\fB\-S, \fB\-\-span\fR
+Display months spanning the date.
 .TP
 \fB\-s\fR, \fB\-\-sunday\fR
 Display Sunday as the first day of the week.
@@ -72,10 +95,10 @@ Display a calendar for the whole year.
 \fB\-Y, \fB\-\-twelve\fR
 Display a calendar for the next twelve months.
 .TP
-\fB\-w\fR, \fB\-\-week\fR[\fI=number\fR]
+\fB\-w\fR, \fB\-\-week\fR[=\fInumber\fR]
 Display week numbers in the calendar (US or ISO-8601).
 .TP
-\fB\-\-color\fR[\fI=when\fR]
+\fB\-\-color\fR[=\fIwhen\fR]
 Colorize the output.  The optional argument \fIwhen\fP
 can be \fBauto\fR, \fBnever\fR or \fBalways\fR.  If the \fIwhen\fR argument is omitted,
 it defaults to \fBauto\fR.  The colors can be disabled; for the current built-in default

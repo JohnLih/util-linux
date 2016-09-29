@@ -99,9 +99,8 @@ static int table_parser_errcb(struct libmnt_table *tb __attribute__((__unused__)
 			const char *filename, int line)
 {
 	if (filename)
-		warnx(_("%s: parse error: ignore entry at line %d."),
-							filename, line);
-	return 0;
+		warnx(_("%s: parse error at line %d -- ignored"), filename, line);
+	return 1;
 }
 
 /*
@@ -403,6 +402,15 @@ try_readonly:
 		case -EBUSY:
 			warnx(_("%s is already mounted"), src);
 			return MOUNT_EX_USAGE;
+		/* -EROFS before syscall can happen only for loop mount */
+		case -EROFS:
+			warnx(_("%s is used as read only loop, mounting read-only"), src);
+			mnt_context_reset_status(cxt);
+			mnt_context_set_mflags(cxt, mflags | MS_RDONLY);
+			rc = mnt_context_mount(cxt);
+			if (!rc)
+				rc = mnt_context_finalize_mount(cxt);
+			goto try_readonly;
 		case -MNT_ERR_NOFSTAB:
 			if (mnt_context_is_swapmatch(cxt)) {
 				warnx(_("can't find %s in %s"),
@@ -446,6 +454,9 @@ try_readonly:
 			return MOUNT_EX_USAGE;
 		case -MNT_ERR_LOOPDEV:
 			warn(_("%s: failed to setup loop device"), src);
+			return MOUNT_EX_FAIL;
+		case -MNT_ERR_LOOPOVERLAP:
+			warnx(_("%s: overlapping loop device exists"), src);
 			return MOUNT_EX_FAIL;
 		default:
 			return handle_generic_errors(rc, _("%s: mount failed"),
@@ -521,7 +532,12 @@ try_readonly:
 			warnx(_("special device %s does not exist"), src);
 		} else {
 			errno = syserr;
-			warn(_("mount(2) failed"));	/* print errno */
+			if (tgt)
+				warn("%s: %s", _("mount(2) failed"), tgt);
+			else if (src)
+				warn("%s: %s", _("mount(2) failed"), src);
+			else
+				warn(_("mount(2) failed"));
 		}
 		break;
 
@@ -536,7 +552,7 @@ try_readonly:
 				 "(a path prefix is not a directory)"), src);
 		} else {
 			errno = syserr;
-			warn(_("mount(2) failed"));     /* print errno */
+			warn("%s: %s", _("mount(2) failed"), tgt);
 		}
 		break;
 
@@ -628,6 +644,9 @@ try_readonly:
 		break;
 
 	case ENOMEDIUM:
+		if (uflags & MNT_MS_NOFAIL)
+			return MOUNT_EX_SUCCESS;
+
 		warnx(_("no medium found on %s"), src);
 		break;
 

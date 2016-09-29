@@ -40,7 +40,7 @@ struct fdisk_script {
 };
 
 
-static void fdisk_script_free_header(struct fdisk_script *dp, struct fdisk_scriptheader *fi)
+static void fdisk_script_free_header(struct fdisk_scriptheader *fi)
 {
 	if (!fi)
 		return;
@@ -133,7 +133,7 @@ done:
  * fdisk_ref_script:
  * @dp: script pointer
  *
- * Incremparts reference counter.
+ * Increments reference counter.
  */
 void fdisk_ref_script(struct fdisk_script *dp)
 {
@@ -152,7 +152,7 @@ static void fdisk_reset_script(struct fdisk_script *dp)
 	while (!list_empty(&dp->headers)) {
 		struct fdisk_scriptheader *fi = list_entry(dp->headers.next,
 						  struct fdisk_scriptheader, headers);
-		fdisk_script_free_header(dp, fi);
+		fdisk_script_free_header(fi);
 	}
 	INIT_LIST_HEAD(&dp->headers);
 }
@@ -161,7 +161,7 @@ static void fdisk_reset_script(struct fdisk_script *dp)
  * fdisk_unref_script:
  * @dp: script pointer
  *
- * De-incremparts reference counter, on zero the @dp is automatically
+ * Decrements reference counter, on zero the @dp is automatically
  * deallocated.
  */
 void fdisk_unref_script(struct fdisk_script *dp)
@@ -275,7 +275,7 @@ int fdisk_script_set_header(struct fdisk_script *dp,
 		DBG(SCRIPT, ul_debugobj(dp, "freeing header %s", name));
 
 		/* no data, remove the header */
-		fdisk_script_free_header(dp, fi);
+		fdisk_script_free_header(fi);
 		return 0;
 	}
 
@@ -290,7 +290,7 @@ int fdisk_script_set_header(struct fdisk_script *dp,
 		fi->name = strdup(name);
 		fi->data = strdup(data);
 		if (!fi->data || !fi->name) {
-			fdisk_script_free_header(dp, fi);
+			fdisk_script_free_header(fi);
 			return -ENOMEM;
 		}
 		list_add_tail(&fi->headers, &dp->headers);
@@ -403,24 +403,31 @@ int fdisk_script_read_context(struct fdisk_script *dp, struct fdisk_context *cxt
 		struct fdisk_labelitem item;
 		char buf[64];
 
+		/* first-lba */
 		rc = fdisk_get_disklabel_item(cxt, GPT_LABELITEM_FIRSTLBA, &item);
-		if (rc == 0) {
-			snprintf(buf, sizeof(buf), "%ju", item.data.num64);
+		if (!rc) {
+			snprintf(buf, sizeof(buf), "%"PRIu64, item.data.num64);
 			rc = fdisk_script_set_header(dp, "first-lba", buf);
 		}
-		if (rc < 0)
-			goto done;
 
-		rc = fdisk_get_disklabel_item(cxt, GPT_LABELITEM_LASTLBA, &item);
-		if (rc == 0) {
-			snprintf(buf, sizeof(buf), "%ju", item.data.num64);
+		/* last-lba */
+		if (!rc)
+			rc = fdisk_get_disklabel_item(cxt, GPT_LABELITEM_LASTLBA, &item);
+		if (!rc) {
+			snprintf(buf, sizeof(buf), "%"PRIu64, item.data.num64);
 			rc = fdisk_script_set_header(dp, "last-lba", buf);
 		}
-		if (rc < 0)
-			goto done;
+
+		/* table-length */
+		if (!rc) {
+			size_t n = fdisk_get_npartitions(cxt);
+			if (n != FDISK_GPT_NPARTITIONS_DEFAULT) {
+				snprintf(buf, sizeof(buf), "%zu", n);
+				rc = fdisk_script_set_header(dp, "table-length", buf);
+			}
+		}
 	}
 
-done:
 	DBG(SCRIPT, ul_debugobj(dp, "read context done [rc=%d]", rc));
 	return rc;
 }
@@ -528,9 +535,9 @@ static int write_file_json(struct fdisk_script *dp, FILE *f)
 		}
 
 		if (fdisk_partition_has_start(pa))
-			fprintf(f, ", \"start\": %ju", pa->start);
+			fprintf(f, ", \"start\": %ju", (uintmax_t)pa->start);
 		if (fdisk_partition_has_size(pa))
-			fprintf(f, ", \"size\": %ju", pa->size);
+			fprintf(f, ", \"size\": %ju", (uintmax_t)pa->size);
 
 		if (pa->type && fdisk_parttype_get_string(pa->type))
 			fprintf(f, ", \"type\": \"%s\"", fdisk_parttype_get_string(pa->type));
@@ -554,7 +561,7 @@ static int write_file_json(struct fdisk_script *dp, FILE *f)
 		if (fdisk_partition_is_bootable(pa))
 			fprintf(f, ", \"bootable\": true");
 
-		if (ct < fdisk_table_get_nents(dp->table))
+		if ((size_t)ct < fdisk_table_get_nents(dp->table))
 			fputs("},\n", f);
 		else
 			fputs("}\n", f);
@@ -614,9 +621,9 @@ static int write_file_sfdisk(struct fdisk_script *dp, FILE *f)
 			fprintf(f, "%zu :", pa->partno + 1);
 
 		if (fdisk_partition_has_start(pa))
-			fprintf(f, " start=%12ju", pa->start);
+			fprintf(f, " start=%12ju", (uintmax_t)pa->start);
 		if (fdisk_partition_has_size(pa))
-			fprintf(f, ", size=%12ju", pa->size);
+			fprintf(f, ", size=%12ju", (uintmax_t)pa->size);
 
 		if (pa->type && fdisk_parttype_get_string(pa->type))
 			fprintf(f, ", type=%s", fdisk_parttype_get_string(pa->type));
@@ -649,7 +656,7 @@ static int write_file_sfdisk(struct fdisk_script *dp, FILE *f)
  * @dp: script
  * @f: output file
  *
- * Writes script @dp to the ile @f.
+ * Writes script @dp to the file @f.
  *
  * Returns: 0 on success, <0 on error.
  */
@@ -705,8 +712,9 @@ static int parse_line_header(struct fdisk_script *dp, char *s)
 	} else if (strcmp(name, "label-id") == 0
 		   || strcmp(name, "device") == 0
 		   || strcmp(name, "first-lba") == 0
-		   || strcmp(name, "last-lba") == 0) {
-		;					/* whatever is posssible */
+		   || strcmp(name, "last-lba") == 0
+		   || strcmp(name, "table-length") == 0) {
+		;					/* whatever is possible */
 	} else
 		goto done;				/* unknown header */
 
@@ -897,7 +905,7 @@ static int parse_line_nameval(struct fdisk_script *dp, char *s)
 
 		} else if (!strncasecmp(p, "type=", 5) ||
 
-			   !strncasecmp(p, "Id=", 3)) {		/* backward compatiility */
+			   !strncasecmp(p, "Id=", 3)) {		/* backward compatibility */
 			char *type;
 
 			p += (*p == 'I' ? 3 : 5);		/* "Id=" or "type=" */
@@ -960,6 +968,9 @@ static struct fdisk_parttype *translate_type_shortcuts(struct fdisk_script *dp, 
 		case 'X':	/* Linux extended */
 			type = "85";
 			break;
+		case 'U':	/* UEFI system */
+			type = "EF";
+			break;
 		}
 	} else if (lb->id == FDISK_DISKLABEL_GPT) {
 		switch (*str) {
@@ -971,6 +982,9 @@ static struct fdisk_parttype *translate_type_shortcuts(struct fdisk_script *dp, 
 			break;
 		case 'H':	/* Home */
 			type = "933AC7E1-2EB4-4F13-B844-0E14E2AEF915";
+			break;
+		case 'U':	/* UEFI system */
+			type = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
 			break;
 		}
 	}
@@ -1045,7 +1059,7 @@ static int parse_line_valcommas(struct fdisk_script *dp, char *s)
 			if (*p == ',' || *p == ';' || alone_sign(sign, p)) {
 				fdisk_partition_end_follow_default(pa, 1);
 				if (sign == TK_PLUS)
-					/* alone '+' means use all possible space, elone '-' means nothing */
+					/* '+' alone means use all possible space, '-' alone means nothing */
 					pa->resize = FDISK_RESIZE_ENLARGE;
 			} else {
 				int pow = 0;
@@ -1117,7 +1131,7 @@ static int parse_line_valcommas(struct fdisk_script *dp, char *s)
 }
 
 /* modifies @s ! */
-int fdisk_script_read_buffer(struct fdisk_script *dp, char *s)
+static int fdisk_script_read_buffer(struct fdisk_script *dp, char *s)
 {
 	int rc = 0;
 
@@ -1160,7 +1174,7 @@ int fdisk_script_read_buffer(struct fdisk_script *dp, char *s)
  * @fn_fgets: callback function
  *
  * The library uses fgets() function to read the next line from the script.
- * This default maybe overrided to another function. Note that the function has
+ * This default maybe overridden by another function. Note that the function has
  * to return the line terminated by \n (for example readline(3) removes \n).
  *
  * Return: 0 on success, <0 on error
@@ -1264,10 +1278,13 @@ int fdisk_script_read_file(struct fdisk_script *dp, FILE *f)
  * @cxt: context
  * @dp: script (or NULL to remove previous reference)
  *
- * Sets reference to the @dp script. The script headers might be used by label
- * drivers to overwrite built-in defaults (for example disk label Id) and label
- * driver might optimize the default semantic to be more usable for scripts
- * (for example to not ask for primary/logical/extended partition type).
+ * Sets reference to the @dp script and remove reference to the previously used
+ * script.
+ *
+ * The script headers might be used by label drivers to overwrite
+ * built-in defaults (for example disk label Id) and label driver might
+ * optimize the default semantic to be more usable for scripts (for example to
+ * not ask for primary/logical/extended partition type).
  *
  * Note that script also contains reference to the fdisk context (see
  * fdisk_new_script()). This context may be completely independent on
@@ -1310,13 +1327,15 @@ struct fdisk_script *fdisk_get_script(struct fdisk_context *cxt)
  * @cxt: context
  * @dp: script
  *
- * Associte context @cxt with script @dp and creates a new empty disklabel.
+ * Associate context @cxt with script @dp and creates a new empty disklabel.
  *
  * Returns: 0 on success, <0 on error.
  */
 int fdisk_apply_script_headers(struct fdisk_context *cxt, struct fdisk_script *dp)
 {
 	const char *name;
+	const char *str;
+	int rc;
 
 	assert(cxt);
 	assert(dp);
@@ -1329,7 +1348,20 @@ int fdisk_apply_script_headers(struct fdisk_context *cxt, struct fdisk_script *d
 	if (!name)
 		return -EINVAL;
 
-	return fdisk_create_disklabel(cxt, name);
+	rc = fdisk_create_disklabel(cxt, name);
+	if (rc)
+		return rc;
+
+	str = fdisk_script_get_header(dp, "table-length");
+	if (str) {
+		uintmax_t sz;
+
+		rc = parse_size(str, &sz, NULL);
+		if (rc == 0)
+			rc = fdisk_gpt_set_npartitions(cxt, sz);
+	}
+
+	return rc;
 }
 
 /**
@@ -1353,6 +1385,7 @@ int fdisk_apply_script(struct fdisk_context *cxt, struct fdisk_script *dp)
 	DBG(CXT, ul_debugobj(cxt, "applying script %p", dp));
 
 	old = fdisk_get_script(cxt);
+	fdisk_ref_script(old);
 
 	/* create empty disk label */
 	rc = fdisk_apply_script_headers(cxt, dp);
@@ -1362,12 +1395,14 @@ int fdisk_apply_script(struct fdisk_context *cxt, struct fdisk_script *dp)
 		rc = fdisk_apply_table(cxt, dp->table);
 
 	fdisk_set_script(cxt, old);
+	fdisk_unref_script(old);
+
 	DBG(CXT, ul_debugobj(cxt, "script done [rc=%d]", rc));
 	return rc;
 }
 
 #ifdef TEST_PROGRAM
-int test_dump(struct fdisk_test *ts, int argc, char *argv[])
+static int test_dump(struct fdisk_test *ts, int argc, char *argv[])
 {
 	char *devname = argv[1];
 	struct fdisk_context *cxt;
@@ -1386,7 +1421,7 @@ int test_dump(struct fdisk_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-int test_read(struct fdisk_test *ts, int argc, char *argv[])
+static int test_read(struct fdisk_test *ts, int argc, char *argv[])
 {
 	char *filename = argv[1];
 	struct fdisk_script *dp;
@@ -1409,7 +1444,7 @@ int test_read(struct fdisk_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-int test_stdin(struct fdisk_test *ts, int argc, char *argv[])
+static int test_stdin(struct fdisk_test *ts, int argc, char *argv[])
 {
 	char buf[BUFSIZ];
 	struct fdisk_script *dp;
@@ -1431,8 +1466,8 @@ int test_stdin(struct fdisk_test *ts, int argc, char *argv[])
 		if (rc == 0) {
 			pa = fdisk_table_get_partition(dp->table, n);
 			printf(" #%zu  %12ju %12ju\n",	n + 1,
-						fdisk_partition_get_start(pa),
-						fdisk_partition_get_size(pa));
+						(uintmax_t)fdisk_partition_get_start(pa),
+						(uintmax_t)fdisk_partition_get_size(pa));
 		}
 	} while (rc == 0);
 
@@ -1444,7 +1479,7 @@ int test_stdin(struct fdisk_test *ts, int argc, char *argv[])
 	return rc;
 }
 
-int test_apply(struct fdisk_test *ts, int argc, char *argv[])
+static int test_apply(struct fdisk_test *ts, int argc, char *argv[])
 {
 	char *devname = argv[1], *scriptname = argv[2];
 	struct fdisk_context *cxt;
@@ -1473,8 +1508,8 @@ int test_apply(struct fdisk_test *ts, int argc, char *argv[])
 	itr = fdisk_new_iter(FDISK_ITER_FORWARD);
 	while (fdisk_table_next_partition(tb, itr, &pa) == 0) {
 		printf(" #%zu  %12ju %12ju\n",	fdisk_partition_get_partno(pa),
-						fdisk_partition_get_start(pa),
-						fdisk_partition_get_size(pa));
+						(uintmax_t)fdisk_partition_get_start(pa),
+						(uintmax_t)fdisk_partition_get_size(pa));
 	}
 
 done:

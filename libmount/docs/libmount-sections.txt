@@ -104,6 +104,7 @@ MNT_ERR_MOUNTOPT
 MNT_ERR_NOFSTAB
 MNT_ERR_NOFSTYPE
 MNT_ERR_NOSOURCE
+MNT_ERR_LOOPOVERLAP
 </SECTION>
 
 <SECTION>
@@ -226,6 +227,7 @@ mnt_fs_set_freq
 mnt_fs_set_fstype
 mnt_fs_set_options
 mnt_fs_set_passno
+mnt_fs_set_priority
 mnt_fs_set_root
 mnt_fs_set_source
 mnt_fs_set_target
@@ -309,6 +311,7 @@ mnt_table_find_source
 mnt_table_find_srcpath
 mnt_table_find_tag
 mnt_table_find_target
+mnt_table_find_target_with_option
 mnt_table_first_fs
 mnt_table_get_cache
 mnt_table_get_intro_comment

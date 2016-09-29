@@ -23,14 +23,14 @@ why:    unnecessary option, only 'S'ector unit is supported
 
 --------------------------
 
-what:  "swapon --summary" output format
-why:   does not provide control on output data formatting. The recommended solution
-       is to use --show=<columns> in all scripts.
+what:   sfdisk --show-pt-geometry
+why:    equal to --show-geometry for a long time
 
 --------------------------
 
-what:  "pid" as binary name for "kill --pid"
-why:   too ugly, too obscure
+what:  "swapon --summary" output format
+why:   does not provide control on output data formatting. The recommended solution
+       is to use --show=<columns> in all scripts.
 
 --------------------------
 

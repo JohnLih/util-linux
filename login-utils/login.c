@@ -48,12 +48,10 @@
 #include <utmp.h>
 #include <stdlib.h>
 #include <sys/syslog.h>
-#include <sys/sysmacros.h>
 #ifdef HAVE_LINUX_MAJOR_H
 # include <linux/major.h>
 #endif
 #include <netdb.h>
-#include <lastlog.h>
 #include <security/pam_appl.h>
 #ifdef HAVE_SECURITY_PAM_MISC_H
 # include <security/pam_misc.h>
@@ -71,6 +69,7 @@
 #include "pathnames.h"
 #include "strutils.h"
 #include "nls.h"
+#include "env.h"
 #include "xalloc.h"
 #include "all-io.h"
 #include "fileutils.h"
@@ -256,13 +255,11 @@ static void motd(void)
 		struct stat st;
 		int fd;
 
-		if (stat(motdfile, &st) || !st.st_size)
-			continue;
 		fd = open(motdfile, O_RDONLY, 0);
 		if (fd < 0)
 			continue;
-
-		sendfile(fileno(stdout), fd, NULL, st.st_size);
+		if (!fstat(fd, &st) && st.st_size)
+			sendfile(fileno(stdout), fd, NULL, st.st_size);
 		close(fd);
 	}
 
@@ -351,7 +348,7 @@ static void chown_tty(struct login_context *cxt)
 }
 
 /*
- * Reads the currect terminal path and initializes cxt->tty_* variables.
+ * Reads the current terminal path and initializes cxt->tty_* variables.
  */
 static void init_tty(struct login_context *cxt)
 {
@@ -360,7 +357,7 @@ static void init_tty(struct login_context *cxt)
 
 	cxt->tty_mode = (mode_t) getlogindefs_num("TTYPERM", TTY_MODE);
 
-	get_terminal_name(0, &cxt->tty_path, &cxt->tty_name, &cxt->tty_number);
+	get_terminal_name(&cxt->tty_path, &cxt->tty_name, &cxt->tty_number);
 
 	/*
 	 * In case login is suid it was possible to use a hardlink as stdin
@@ -402,14 +399,14 @@ static void init_tty(struct login_context *cxt)
 	tcsetattr(0, TCSANOW, &ttt);
 
 	/*
-	 * Let's close file decriptors before vhangup
+	 * Let's close file descriptors before vhangup
 	 * https://lkml.org/lkml/2012/6/5/145
 	 */
 	close(STDIN_FILENO);
 	close(STDOUT_FILENO);
 	close(STDERR_FILENO);
 
-	signal(SIGHUP, SIG_IGN);	/* so vhangup() wont kill us */
+	signal(SIGHUP, SIG_IGN);	/* so vhangup() won't kill us */
 	vhangup();
 	signal(SIGHUP, SIG_DFL);
 
@@ -676,22 +673,14 @@ static struct passwd *get_passwd_entry(const char *username,
 					 struct passwd *pwd)
 {
 	struct passwd *res = NULL;
-	size_t sz = 16384;
 	int x;
 
 	if (!pwdbuf || !username)
 		return NULL;
 
-#ifdef _SC_GETPW_R_SIZE_MAX
-	{
-		long xsz = sysconf(_SC_GETPW_R_SIZE_MAX);
-		if (xsz > 0)
-			sz = (size_t) xsz;
-	}
-#endif
-	*pwdbuf = xrealloc(*pwdbuf, sz);
+	*pwdbuf = xrealloc(*pwdbuf, UL_GETPW_BUFSIZ);
 
-	x = getpwnam_r(username, pwd, *pwdbuf, sz, &res);
+	x = getpwnam_r(username, pwd, *pwdbuf, UL_GETPW_BUFSIZ, &res);
 	if (!res) {
 		errno = x;
 		return NULL;
@@ -1048,31 +1037,34 @@ static void init_environ(struct login_context *cxt)
 
 	/* destroy environment unless user has requested preservation (-p) */
 	if (!cxt->keep_env) {
-		environ = (char **) xmalloc(sizeof(char *));
+		environ = xmalloc(sizeof(char *));
 		memset(environ, 0, sizeof(char *));
 	}
 
-	setenv("HOME", pwd->pw_dir, 0);	/* legal to override */
-	setenv("USER", pwd->pw_name, 1);
-	setenv("SHELL", pwd->pw_shell, 1);
-	setenv("TERM", termenv ? termenv : "dumb", 1);
+	xsetenv("HOME", pwd->pw_dir, 0);	/* legal to override */
+	xsetenv("USER", pwd->pw_name, 1);
+	xsetenv("SHELL", pwd->pw_shell, 1);
+	xsetenv("TERM", termenv ? termenv : "dumb", 1);
 	free(termenv);
 
-	if (pwd->pw_uid)
-		logindefs_setenv("PATH", "ENV_PATH", _PATH_DEFPATH);
+	if (pwd->pw_uid) {
+		if (logindefs_setenv("PATH", "ENV_PATH", _PATH_DEFPATH) != 0)
+			err(EXIT_FAILURE, _("failed to set the %s environment variable"), "PATH");
 
-	else if (logindefs_setenv("PATH", "ENV_ROOTPATH", NULL) != 0)
-		logindefs_setenv("PATH", "ENV_SUPATH", _PATH_DEFPATH_ROOT);
+	} else if (logindefs_setenv("PATH", "ENV_ROOTPATH", NULL) != 0 &&
+		   logindefs_setenv("PATH", "ENV_SUPATH", _PATH_DEFPATH_ROOT) != 0) {
+			err(EXIT_FAILURE, _("failed to set the %s environment variable"), "PATH");
+	}
 
 	/* mailx will give a funny error msg if you forget this one */
 	len = snprintf(tmp, sizeof(tmp), "%s/%s", _PATH_MAILDIR, pwd->pw_name);
-	if (len > 0 && (size_t) len + 1 <= sizeof(tmp))
-		setenv("MAIL", tmp, 0);
+	if (len > 0 && (size_t) len < sizeof(tmp))
+		xsetenv("MAIL", tmp, 0);
 
 	/* LOGNAME is not documented in login(1) but HP-UX 6.5 does it. We'll
 	 * not allow modifying it.
 	 */
-	setenv("LOGNAME", pwd->pw_name, 1);
+	xsetenv("LOGNAME", pwd->pw_name, 1);
 
 	env = pam_getenvlist(cxt->pamh);
 	for (i = 0; env && env[i]; i++)

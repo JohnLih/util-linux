@@ -248,7 +248,7 @@ static const char *cache_find_path(struct libmnt_cache *cache, const char *path)
 		struct mnt_cache_entry *e = &cache->ents[i];
 		if (!(e->flag & MNT_CACHE_ISPATH))
 			continue;
-		if (streq_except_trailing_slash(path, e->key))
+		if (streq_paths(path, e->key))
 			return e->value;
 	}
 	return NULL;
@@ -635,6 +635,7 @@ char *mnt_pretty_path(const char *path, struct libmnt_cache *cache)
 		if (loopcxt_is_autoclear(&lc)) {
 			char *tmp = loopcxt_get_backing_file(&lc);
 			if (tmp) {
+				loopcxt_deinit(&lc);
 				if (!cache)
 					free(pretty);	/* not cached, deallocate */
 				return tmp;		/* return backing file */
@@ -719,7 +720,7 @@ char *mnt_resolve_spec(const char *spec, struct libmnt_cache *cache)
 
 #ifdef TEST_PROGRAM
 
-int test_resolve_path(struct libmnt_test *ts, int argc, char *argv[])
+static int test_resolve_path(struct libmnt_test *ts, int argc, char *argv[])
 {
 	char line[BUFSIZ];
 	struct libmnt_cache *cache;
@@ -742,7 +743,7 @@ int test_resolve_path(struct libmnt_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-int test_resolve_spec(struct libmnt_test *ts, int argc, char *argv[])
+static int test_resolve_spec(struct libmnt_test *ts, int argc, char *argv[])
 {
 	char line[BUFSIZ];
 	struct libmnt_cache *cache;
@@ -765,7 +766,7 @@ int test_resolve_spec(struct libmnt_test *ts, int argc, char *argv[])
 	return 0;
 }
 
-int test_read_tags(struct libmnt_test *ts, int argc, char *argv[])
+static int test_read_tags(struct libmnt_test *ts, int argc, char *argv[])
 {
 	char line[BUFSIZ];
 	struct libmnt_cache *cache;

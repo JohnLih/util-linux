@@ -55,7 +55,7 @@ struct gpt_header {
 
 	uint64_t	my_lba;			/* location of this header copy */
 	uint64_t	alternate_lba;		/* location of the other header copy */
-	uint64_t	first_usable_lba;	/* lirst usable LBA for partitions */
+	uint64_t	first_usable_lba;	/* first usable LBA for partitions */
 	uint64_t	last_usable_lba;	/* last usable LBA for partitions */
 
 	efi_guid_t	disk_guid;		/* disk UUID */
@@ -102,9 +102,10 @@ struct gpt_entry {
 /*
  * EFI uses crc32 with ~0 seed and xor's with ~0 at the end.
  */
-static inline uint32_t count_crc32(const unsigned char *buf, size_t len)
+static inline uint32_t count_crc32(const unsigned char *buf, size_t len,
+				   size_t exclude_off, size_t exclude_len)
 {
-	return (crc32(~0L, buf, len) ^ ~0L);
+	return (crc32_exclude_offset(~0L, buf, len, exclude_off, exclude_len) ^ ~0L);
 }
 
 static inline unsigned char *get_lba_buffer(blkid_probe pr,
@@ -132,7 +133,7 @@ static void swap_efi_guid(efi_guid_t *uid)
 
 static int last_lba(blkid_probe pr, uint64_t *lba)
 {
-	blkid_loff_t sz = blkid_probe_get_size(pr);
+	uint64_t sz = blkid_probe_get_size(pr);
 	unsigned int ssz = blkid_probe_get_sectorsize(pr);
 
 	if (sz < ssz)
@@ -154,7 +155,7 @@ static int last_lba(blkid_probe pr, uint64_t *lba)
  * (due DOS PT limitations).
  *
  * Note that the PMBR detection is optional (enabled by default) and could be
- * disabled by BLKID_PARTS_FOPCE_GPT flag (see also blkid_paertitions_set_flags()).
+ * disabled by BLKID_PARTS_FOPCE_GPT flag (see also blkid_partitions_set_flags()).
  */
 static int is_pmbr_valid(blkid_probe pr, int *has)
 {
@@ -207,7 +208,7 @@ static struct gpt_header *get_gpt_header(
 				uint64_t lastlba)
 {
 	struct gpt_header *h;
-	uint32_t crc, orgcrc;
+	uint32_t crc;
 	uint64_t lu, fu;
 	size_t esz;
 	uint32_t hsz, ssz;
@@ -231,12 +232,11 @@ static struct gpt_header *get_gpt_header(
 		return NULL;
 
 	/* Header has to be verified when header_crc32 is zero */
-	orgcrc = h->header_crc32;
-	h->header_crc32 = 0;
-	crc = count_crc32((unsigned char *) h, hsz);
-	h->header_crc32 = orgcrc;
+	crc = count_crc32((unsigned char *) h, hsz,
+			offsetof(struct gpt_header, header_crc32),
+			sizeof(h->header_crc32));
 
-	if (crc != le32_to_cpu(orgcrc)) {
+	if (crc != le32_to_cpu(h->header_crc32)) {
 		DBG(LOWPROBE, ul_debug("GPT header corrupted"));
 		return NULL;
 	}
@@ -289,7 +289,7 @@ static struct gpt_header *get_gpt_header(
 	}
 
 	/* Validate entries */
-	crc = count_crc32((unsigned char *) *ents, esz);
+	crc = count_crc32((unsigned char *) *ents, esz, 0, 0);
 	if (crc != le32_to_cpu(h->partition_entry_array_crc32)) {
 		DBG(LOWPROBE, ul_debug("GPT entries corrupted"));
 		return NULL;
@@ -343,7 +343,7 @@ static int probe_gpt_pt(blkid_probe pr,
 
 	if (blkid_partitions_need_typeonly(pr)) {
 		/* Non-binary interface -- caller does not ask for details
-		 * about partitions, just set generic varibles only. */
+		 * about partitions, just set generic variables only. */
 		blkid_partitions_set_ptuuid(pr, (unsigned char *) &guid);
 		return BLKID_PROBE_OK;
 	}
@@ -423,7 +423,7 @@ const struct blkid_idinfo gpt_pt_idinfo =
 
 	/*
 	 * It would be possible to check for DOS signature (0xAA55), but
-	 * unfortunately almost all EFI GPT implemenations allow to optionaly
+	 * unfortunately almost all EFI GPT implementations allow to optionally
 	 * skip the legacy MBR. We follows this behavior and MBR is optional.
 	 * See is_valid_pmbr().
 	 *

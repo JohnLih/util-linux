@@ -13,11 +13,12 @@ ts_check_test_command "$TS_CMD_FINDMNT"
 ts_check_test_command "$TS_CMD_MOUNT"
 ts_check_test_command "$TS_CMD_UMOUNT"
 ts_check_test_command "$TS_CMD_UUIDGEN"
+
+ts_skip_nonroot
 ts_check_prog "mkfs.ext3"
 ts_check_prog "mkfs.ext4"
 
 ts_init_py libmount
-ts_skip_nonroot
 
 TESTPROG="$TS_HELPER_PYLIBMOUNT_CONTEXT"
 [ -x $TESTPROG ] || ts_die "test script missing"
@@ -30,15 +31,16 @@ TS_NOEXIST="$TS_OUTDIR/${TS_TESTNAME}-${TS_SUBNAME}-noex"
 [ -d $TS_NOEXIST ] && rmdir $TS_NOEXIST
 
 ts_log "Init device"
-umount $MOUNTPOINT &> /dev/null
+$TS_CMD_UMOUNT $MOUNTPOINT &> /dev/null
 
 # set global variable TS_DEVICE
 ts_scsi_debug_init dev_size_mb=100
 DEVNAME=$(basename $TS_DEVICE)
 
-grep -q '#define USE_LIBMOUNT_FORCE_MOUNTINFO' ${top_builddir}/config.h
-if [ $? == 0 ]; then
-	MOUNTINFO_ONLY=yes
+MOUNTINFO_ONLY=yes
+has_mtab=$( ts_has_mtab_support )
+if [ "$has_mtab" == "yes" ]; then
+	MOUNTINFO_ONLY=no
 fi
 
 ts_log "Create partitions"
@@ -54,7 +56,6 @@ EOF
 
 DEVICE="${TS_DEVICE}1"
 
-sleep 1
 udevadm settle
 
 grep -q $DEVNAME /proc/partitions

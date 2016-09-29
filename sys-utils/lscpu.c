@@ -52,6 +52,10 @@
 # endif
 #endif
 
+#if defined(HAVE_LIBRTAS)
+#include <librtas.h>
+#endif
+
 #include <libsmartcols.h>
 
 #include "cpuset.h"
@@ -69,6 +73,7 @@
 
 /* /sys paths */
 #define _PATH_SYS_SYSTEM	"/sys/devices/system"
+#define _PATH_SYS_HYP_FEATURES "/sys/hypervisor/properties/features"
 #define _PATH_SYS_CPU		_PATH_SYS_SYSTEM "/cpu"
 #define _PATH_SYS_NODE		_PATH_SYS_SYSTEM "/node"
 #define _PATH_PROC_XEN		"/proc/xen"
@@ -81,6 +86,15 @@
 #define _PATH_PROC_BC	"/proc/bc"
 #define _PATH_PROC_DEVICETREE	"/proc/device-tree"
 #define _PATH_DEV_MEM 		"/dev/mem"
+
+/* Xen Domain feature flag used for /sys/hypervisor/properties/features */
+#define XENFEAT_supervisor_mode_kernel		3
+#define XENFEAT_mmu_pt_update_preserve_ad	5
+#define XENFEAT_hvm_callback_vector			8
+
+#define XEN_FEATURES_PV_MASK	(1U << XENFEAT_mmu_pt_update_preserve_ad)
+#define XEN_FEATURES_PVH_MASK	( (1U << XENFEAT_supervisor_mode_kernel) \
+								| (1U << XENFEAT_hvm_callback_vector) )
 
 /* virtualization types */
 enum {
@@ -184,19 +198,25 @@ struct polarization_modes polar_modes[] = {
 struct lscpu_desc {
 	char	*arch;
 	char	*vendor;
+	char	*machinetype;	/* s390 */
 	char	*family;
 	char	*model;
 	char	*modelname;
+	char	*revision;  /* alternative for model (ppc) */
+	char	*cpu;       /* alternative for modelname (ppc, sparc) */
 	char	*virtflag;	/* virtualization flag (vmx, svm) */
 	char	*hypervisor;	/* hypervisor software */
 	int	hyper;		/* hypervisor vendor ID */
 	int	virtype;	/* VIRT_PARA|FULL|NONE ? */
 	char	*mhz;
+	char	*dynamic_mhz;	/* dynamic mega hertz (s390) */
+	char	*static_mhz;	/* static mega hertz (s390) */
 	char	**maxmhz;	/* maximum mega hertz */
 	char	**minmhz;	/* minimum mega hertz */
 	char	*stepping;
 	char    *bogomips;
 	char	*flags;
+	char	*mtid;		/* maximum thread id (s390) */
 	int	dispatching;	/* none, horizontal or vertical */
 	int	mode;		/* rm, lm or/and tm */
 
@@ -209,6 +229,9 @@ struct lscpu_desc {
 
 	int		ncaches;
 	struct cpu_cache *caches;
+
+	int		necaches;	/* extra caches (s390) */
+	struct cpu_cache *ecaches;
 
 	/*
 	 * All maps are sequentially indexed (0..ncpuspos), the array index
@@ -224,24 +247,36 @@ struct lscpu_desc {
 	int		*idx2nodenum;	/* Support for discontinuous nodes */
 	cpu_set_t	**nodemaps;	/* array with NUMA nodes */
 
+	/* drawers -- based on drawer_siblings (internal kernel map of cpuX's
+	 * hardware threads within the same drawer */
+	int		ndrawers;	/* number of all online drawers */
+	cpu_set_t	**drawermaps;	/* unique drawer_siblings */
+	int		*drawerids;	/* physical drawer ids */
+
 	/* books -- based on book_siblings (internal kernel map of cpuX's
 	 * hardware threads within the same book */
 	int		nbooks;		/* number of all online books */
 	cpu_set_t	**bookmaps;	/* unique book_siblings */
+	int		*bookids;	/* physical book ids */
 
 	/* sockets -- based on core_siblings (internal kernel map of cpuX's
 	 * hardware threads within the same physical_package_id (socket)) */
 	int		nsockets;	/* number of all online sockets */
 	cpu_set_t	**socketmaps;	/* unique core_siblings */
+	int		*socketids;	/* physical socket ids */
 
-	/* cores -- based on thread_siblings (internel kernel map of cpuX's
+	/* cores -- based on thread_siblings (internal kernel map of cpuX's
 	 * hardware threads within the same core as cpuX) */
 	int		ncores;		/* number of all online cores */
 	cpu_set_t	**coremaps;	/* unique thread_siblings */
+	int		*coreids;	/* physical core ids */
 
 	int		*polarization;	/* cpu polarization */
 	int		*addresses;	/* physical cpu addresses */
 	int		*configured;	/* cpu configured */
+	int		physsockets;	/* Physical sockets (modules) */
+	int		physchips;	/* Physical chips */
+	int		physcoresperchip;	/* Physical cores per chip */
 };
 
 enum {
@@ -261,7 +296,8 @@ struct lscpu_modifier {
 	unsigned int	hex:1,		/* print CPU masks rather than CPU lists */
 			compat:1,	/* use backwardly compatible format */
 			online:1,	/* print online CPUs */
-			offline:1;	/* print offline CPUs */
+			offline:1,	/* print offline CPUs */
+			physical:1;	/* use physical numbers */
 };
 
 static int maxcpus;		/* size in bits of kernel cpu mask */
@@ -284,6 +320,7 @@ enum {
 	COL_SOCKET,
 	COL_NODE,
 	COL_BOOK,
+	COL_DRAWER,
 	COL_CACHE,
 	COL_POLARIZATION,
 	COL_ADDRESS,
@@ -309,6 +346,7 @@ static struct lscpu_coldesc coldescs[] =
 	[COL_SOCKET]       = { "SOCKET", N_("logical socket number") },
 	[COL_NODE]         = { "NODE", N_("logical NUMA node number") },
 	[COL_BOOK]         = { "BOOK", N_("logical book number") },
+	[COL_DRAWER]       = { "DRAWER", N_("logical drawer number") },
 	[COL_CACHE]        = { "CACHE", N_("shows how caches are shared between CPUs") },
 	[COL_POLARIZATION] = { "POLARIZATION", N_("CPU dispatching mode on virtual hardware") },
 	[COL_ADDRESS]      = { "ADDRESS", N_("physical address of a CPU") },
@@ -344,7 +382,8 @@ lookup(char *line, char *pattern, char **value)
 	char *p, *v;
 	int len = strlen(pattern);
 
-	if (!*line)
+	/* don't re-fill already found tags, first one wins */
+	if (!*line || *value)
 		return 0;
 
 	/* pattern */
@@ -375,6 +414,63 @@ lookup(char *line, char *pattern, char **value)
 	return 1;
 }
 
+/* Parse extra cache lines contained within /proc/cpuinfo but which are not
+ * part of the cache topology information within the sysfs filesystem.
+ * This is true for all shared caches on e.g. s390. When there are layers of
+ * hypervisors in between it is not knows which CPUs share which caches.
+ * Therefore information about shared caches is only available in
+ * /proc/cpuinfo.
+ * Format is:
+ * "cache<nr> : level=<lvl> type=<type> scope=<scope> size=<size> line_size=<lsz> associativity=<as>"
+ */
+static int
+lookup_cache(char *line, struct lscpu_desc *desc)
+{
+	struct cpu_cache *cache;
+	long long size;
+	char *p, type;
+	int level;
+
+	/* Make sure line starts with "cache<nr> :" */
+	if (strncmp(line, "cache", 5))
+		return 0;
+	for (p = line + 5; isdigit(*p); p++);
+	for (; isspace(*p); p++);
+	if (*p != ':')
+		return 0;
+
+	p = strstr(line, "scope=") + 6;
+	/* Skip private caches, also present in sysfs */
+	if (!p || strncmp(p, "Private", 7) == 0)
+		return 0;
+	p = strstr(line, "level=");
+	if (!p || sscanf(p, "level=%d", &level) != 1)
+		return 0;
+	p = strstr(line, "type=") + 5;
+	if (!p || !*p)
+		return 0;
+	type = 0;
+	if (strncmp(p, "Data", 4) == 0)
+		type = 'd';
+	if (strncmp(p, "Instruction", 11) == 0)
+		type = 'i';
+	p = strstr(line, "size=");
+	if (!p || sscanf(p, "size=%lld", &size) != 1)
+	       return 0;
+
+	desc->necaches++;
+	desc->ecaches = xrealloc(desc->ecaches,
+				 desc->necaches * sizeof(struct cpu_cache));
+	cache = &desc->ecaches[desc->necaches - 1];
+	memset(cache, 0 , sizeof(*cache));
+	if (type)
+		xasprintf(&cache->name, "L%d%c", level, type);
+	else
+		xasprintf(&cache->name, "L%d", level);
+	xasprintf(&cache->size, "%lldK", size);
+	return 1;
+}
+
 /* Don't init the mode for platforms where we are not able to
  * detect that CPU supports 64-bit mode.
  */
@@ -400,6 +496,45 @@ init_mode(struct lscpu_modifier *mod)
 	return m;
 }
 
+#if defined(HAVE_LIBRTAS)
+#define PROCESSOR_MODULE_INFO	43
+static int strbe16toh(const char *buf, int offset)
+{
+	return (buf[offset] << 8) + buf[offset+1];
+}
+
+static void read_physical_info_powerpc(struct lscpu_desc *desc)
+{
+	char buf[BUFSIZ];
+	int rc, len, ntypes;
+
+	desc->physsockets = desc->physchips = desc->physcoresperchip = 0;
+
+	rc = rtas_get_sysparm(PROCESSOR_MODULE_INFO, sizeof(buf), buf);
+	if (rc < 0)
+		return;
+
+	len = strbe16toh(buf, 0);
+	if (len < 8)
+		return;
+
+	ntypes = strbe16toh(buf, 2);
+
+	assert(ntypes <= 1);
+	if (!ntypes)
+		return;
+
+	desc->physsockets = strbe16toh(buf, 4);
+	desc->physchips = strbe16toh(buf, 6);
+	desc->physcoresperchip = strbe16toh(buf, 8);
+}
+#else
+static void read_physical_info_powerpc(
+		struct lscpu_desc *desc __attribute__((__unused__)))
+{
+}
+#endif
+
 static void
 read_basicinfo(struct lscpu_desc *desc, struct lscpu_modifier *mod)
 {
@@ -423,11 +558,17 @@ read_basicinfo(struct lscpu_desc *desc, struct lscpu_modifier *mod)
 		else if (lookup(buf, "model name", &desc->modelname)) ;
 		else if (lookup(buf, "stepping", &desc->stepping)) ;
 		else if (lookup(buf, "cpu MHz", &desc->mhz)) ;
+		else if (lookup(buf, "cpu MHz dynamic", &desc->dynamic_mhz)) ; /* s390 */
+		else if (lookup(buf, "cpu MHz static", &desc->static_mhz)) ;   /* s390 */
 		else if (lookup(buf, "flags", &desc->flags)) ;		/* x86 */
 		else if (lookup(buf, "features", &desc->flags)) ;	/* s390 */
 		else if (lookup(buf, "type", &desc->flags)) ;		/* sparc64 */
 		else if (lookup(buf, "bogomips", &desc->bogomips)) ;
 		else if (lookup(buf, "bogomips per cpu", &desc->bogomips)) ; /* s390 */
+		else if (lookup(buf, "cpu", &desc->cpu)) ;
+		else if (lookup(buf, "revision", &desc->revision)) ;
+		else if (lookup(buf, "max thread id", &desc->mtid)) ; /* s390 */
+		else if (lookup_cache(buf, desc)) ;
 		else
 			continue;
 	}
@@ -506,6 +647,18 @@ read_basicinfo(struct lscpu_desc *desc, struct lscpu_modifier *mod)
 		desc->dispatching = path_read_s32(_PATH_SYS_CPU "/dispatching");
 	else
 		desc->dispatching = -1;
+
+	if (mod->system == SYSTEM_LIVE)
+		read_physical_info_powerpc(desc);
+
+	if (path_exist(_PATH_PROC_SYSINFO)) {
+		FILE *fd = path_fopen("r", 0, _PATH_PROC_SYSINFO);
+
+		while (fd && fgets(buf, sizeof(buf), fd) != NULL && !desc->machinetype)
+			lookup(buf, "Type", &desc->machinetype);
+		if (fd)
+			fclose(fd);
+	}
 }
 
 static int
@@ -757,10 +910,28 @@ read_hypervisor(struct lscpu_desc *desc, struct lscpu_modifier *mod)
 			desc->hyper = HYPER_VMWARE;
 	}
 
-	if (desc->hyper)
+	if (desc->hyper) {
 		desc->virtype = VIRT_FULL;
 
-	else if (read_hypervisor_powerpc(desc) > 0) {}
+		if (desc->hyper == HYPER_XEN) {
+			uint32_t features;
+
+			fd = path_fopen("r", 0, _PATH_SYS_HYP_FEATURES);
+			if (fd && fscanf(fd, "%x", &features) == 1) {
+				/* Xen PV domain */
+				if (features & XEN_FEATURES_PV_MASK)
+					desc->virtype = VIRT_PARA;
+				/* Xen PVH domain */
+				else if ((features & XEN_FEATURES_PVH_MASK)
+								== XEN_FEATURES_PVH_MASK)
+					desc->virtype = VIRT_PARA;
+				fclose(fd);
+			} else {
+				err(EXIT_FAILURE, _("failed to read from: %s"),
+						_PATH_SYS_HYP_FEATURES);
+			}
+		}
+	} else if (read_hypervisor_powerpc(desc) > 0) {}
 
 	/* Xen para-virt or dom0 */
 	else if (path_exist(_PATH_PROC_XEN)) {
@@ -892,8 +1063,10 @@ static int add_cpuset_to_array(cpu_set_t **ary, int *items, cpu_set_t *set)
 static void
 read_topology(struct lscpu_desc *desc, int idx)
 {
-	cpu_set_t *thread_siblings, *core_siblings, *book_siblings;
-	int num = real_cpu_num(desc, idx);
+	cpu_set_t *thread_siblings, *core_siblings;
+	cpu_set_t *book_siblings, *drawer_siblings;
+	int coreid, socketid, bookid, drawerid;
+	int i, num = real_cpu_num(desc, idx);
 
 	if (!path_exist(_PATH_SYS_CPU "/cpu%d/topology/thread_siblings", num))
 		return;
@@ -906,9 +1079,29 @@ read_topology(struct lscpu_desc *desc, int idx)
 	if (path_exist(_PATH_SYS_CPU "/cpu%d/topology/book_siblings", num))
 		book_siblings = path_read_cpuset(maxcpus, _PATH_SYS_CPU
 					    "/cpu%d/topology/book_siblings", num);
+	drawer_siblings = NULL;
+	if (path_exist(_PATH_SYS_CPU "/cpu%d/topology/drawer_siblings", num))
+		drawer_siblings = path_read_cpuset(maxcpus, _PATH_SYS_CPU
+					    "/cpu%d/topology/drawer_siblings", num);
+	coreid = -1;
+	if (path_exist(_PATH_SYS_CPU "/cpu%d/topology/core_id", num))
+		coreid = path_read_s32(_PATH_SYS_CPU
+				       "/cpu%d/topology/core_id", num);
+	socketid = -1;
+	if (path_exist(_PATH_SYS_CPU "/cpu%d/topology/physical_package_id", num))
+		socketid = path_read_s32(_PATH_SYS_CPU
+				       "/cpu%d/topology/physical_package_id", num);
+	bookid = -1;
+	if (path_exist(_PATH_SYS_CPU "/cpu%d/topology/book_id", num))
+		bookid = path_read_s32(_PATH_SYS_CPU
+				       "/cpu%d/topology/book_id", num);
+	drawerid = -1;
+	if (path_exist(_PATH_SYS_CPU "/cpu%d/topology/drawer_id", num))
+		drawerid = path_read_s32(_PATH_SYS_CPU
+				       "/cpu%d/topology/drawer_id", num);
 
 	if (!desc->coremaps) {
-		int nbooks, nsockets, ncores, nthreads;
+		int ndrawers, nbooks, nsockets, ncores, nthreads;
 		size_t setsize = CPU_ALLOC_SIZE(maxcpus);
 
 		/* threads within one core */
@@ -934,12 +1127,17 @@ read_topology(struct lscpu_desc *desc, int idx)
 		if (!nbooks)
 			nbooks = 1;
 
+		/* number of drawers */
+		ndrawers = desc->ncpus / nbooks / nthreads / ncores / nsockets;
+		if (!ndrawers)
+			ndrawers = 1;
+
 		/* all threads, see also read_basicinfo()
 		 * -- fallback for kernels without
 		 *    /sys/devices/system/cpu/online.
 		 */
 		if (!desc->nthreads)
-			desc->nthreads = nbooks * nsockets * ncores * nthreads;
+			desc->nthreads = ndrawers * nbooks * nsockets * ncores * nthreads;
 
 		/* For each map we make sure that it can have up to ncpuspos
 		 * entries. This is because we cannot reliably calculate the
@@ -949,14 +1147,36 @@ read_topology(struct lscpu_desc *desc, int idx)
 		 */
 		desc->coremaps = xcalloc(desc->ncpuspos, sizeof(cpu_set_t *));
 		desc->socketmaps = xcalloc(desc->ncpuspos, sizeof(cpu_set_t *));
-		if (book_siblings)
+		desc->coreids = xcalloc(desc->ncpuspos, sizeof(*desc->drawerids));
+		desc->socketids = xcalloc(desc->ncpuspos, sizeof(*desc->drawerids));
+		for (i = 0; i < desc->ncpuspos; i++)
+			desc->coreids[i] = desc->socketids[i] = -1;
+		if (book_siblings) {
 			desc->bookmaps = xcalloc(desc->ncpuspos, sizeof(cpu_set_t *));
+			desc->bookids = xcalloc(desc->ncpuspos, sizeof(*desc->drawerids));
+			for (i = 0; i < desc->ncpuspos; i++)
+				desc->bookids[i] = -1;
+		}
+		if (drawer_siblings) {
+			desc->drawermaps = xcalloc(desc->ncpuspos, sizeof(cpu_set_t *));
+			desc->drawerids = xcalloc(desc->ncpuspos, sizeof(*desc->drawerids));
+			for (i = 0; i < desc->ncpuspos; i++)
+				desc->drawerids[i] = -1;
+		}
 	}
 
 	add_cpuset_to_array(desc->socketmaps, &desc->nsockets, core_siblings);
+	desc->coreids[idx] = coreid;
 	add_cpuset_to_array(desc->coremaps, &desc->ncores, thread_siblings);
-	if (book_siblings)
+	desc->socketids[idx] = socketid;
+	if (book_siblings) {
 		add_cpuset_to_array(desc->bookmaps, &desc->nbooks, book_siblings);
+		desc->bookids[idx] = bookid;
+	}
+	if (drawer_siblings) {
+		add_cpuset_to_array(desc->drawermaps, &desc->ndrawers, drawer_siblings);
+		desc->drawerids[idx] = drawerid;
+	}
 }
 
 static void
@@ -1193,24 +1413,57 @@ get_cell_data(struct lscpu_desc *desc, int idx, int col,
 		snprintf(buf, bufsz, "%d", cpu);
 		break;
 	case COL_CORE:
-		if (cpuset_ary_isset(cpu, desc->coremaps,
-				     desc->ncores, setsize, &i) == 0)
-			snprintf(buf, bufsz, "%zu", i);
+		if (mod->physical) {
+			if (desc->coreids[idx] == -1)
+				snprintf(buf, bufsz, "-");
+			else
+				snprintf(buf, bufsz, "%d", desc->coreids[idx]);
+		} else {
+			if (cpuset_ary_isset(cpu, desc->coremaps,
+					     desc->ncores, setsize, &i) == 0)
+				snprintf(buf, bufsz, "%zu", i);
+		}
 		break;
 	case COL_SOCKET:
-		if (cpuset_ary_isset(cpu, desc->socketmaps,
-				     desc->nsockets, setsize, &i) == 0)
-			snprintf(buf, bufsz, "%zu", i);
+		if (mod->physical) {
+			if (desc->socketids[idx] ==  -1)
+				snprintf(buf, bufsz, "-");
+			else
+				snprintf(buf, bufsz, "%d", desc->socketids[idx]);
+		} else {
+			if (cpuset_ary_isset(cpu, desc->socketmaps,
+					     desc->nsockets, setsize, &i) == 0)
+				snprintf(buf, bufsz, "%zu", i);
+		}
 		break;
 	case COL_NODE:
 		if (cpuset_ary_isset(cpu, desc->nodemaps,
 				     desc->nnodes, setsize, &i) == 0)
 			snprintf(buf, bufsz, "%d", desc->idx2nodenum[i]);
 		break;
+	case COL_DRAWER:
+		if (mod->physical) {
+			if (desc->drawerids[idx] == -1)
+				snprintf(buf, bufsz, "-");
+			else
+				snprintf(buf, bufsz, "%d", desc->drawerids[idx]);
+		} else {
+			if (cpuset_ary_isset(cpu, desc->drawermaps,
+					     desc->ndrawers, setsize, &i) == 0)
+				snprintf(buf, bufsz, "%zu", i);
+		}
+		break;
 	case COL_BOOK:
-		if (cpuset_ary_isset(cpu, desc->bookmaps,
-				     desc->nbooks, setsize, &i) == 0)
-			snprintf(buf, bufsz, "%zu", i);
+		if (mod->physical) {
+			if (desc->bookids[idx] == -1)
+				snprintf(buf, bufsz, "-");
+			else
+				snprintf(buf, bufsz, "%d", desc->bookids[idx]);
+		} else {
+			if (cpuset_ary_isset(cpu, desc->bookmaps,
+					     desc->nbooks, setsize, &i) == 0)
+				snprintf(buf, bufsz, "%zu", i);
+		}
 		break;
 	case COL_CACHE:
 	{
@@ -1224,15 +1477,17 @@ get_cell_data(struct lscpu_desc *desc, int idx, int col,
 			if (cpuset_ary_isset(cpu, ca->sharedmaps,
 					     ca->nsharedmaps, setsize, &i) == 0) {
 				int x = snprintf(p, sz, "%zu", i);
-				if (x <= 0 || (size_t) x + 2 >= sz)
+				if (x < 0 || (size_t) x >= sz)
 					return NULL;
 				p += x;
 				sz -= x;
 			}
 			if (j != 0) {
+				if (sz < 2)
+					return NULL;
 				*p++ = mod->compat ? ',' : ':';
 				*p = '\0';
-				sz++;
+				sz--;
 			}
 		}
 		break;
@@ -1297,14 +1552,16 @@ get_cell_header(struct lscpu_desc *desc, int col,
 
 		for (i = desc->ncaches - 1; i >= 0; i--) {
 			int x = snprintf(p, sz, "%s", desc->caches[i].name);
-			if (x <= 0 || (size_t) x + 2 > sz)
+			if (x < 0 || (size_t) x >= sz)
 				return NULL;
 			sz -= x;
 			p += x;
 			if (i > 0) {
+				if (sz < 2)
+					return NULL;
 				*p++ = mod->compat ? ',' : ':';
 				*p = '\0';
-				sz++;
+				sz--;
 			}
 		}
 		if (desc->ncaches)
@@ -1549,9 +1806,11 @@ print_summary(struct lscpu_desc *desc, struct lscpu_modifier *mod)
 	}
 
 	if (desc->nsockets) {
-		int cores_per_socket, sockets_per_book, books;
+		int threads_per_core, cores_per_socket, sockets_per_book;
+		int books_per_drawer, drawers;
 
-		cores_per_socket = sockets_per_book = books = 0;
+		threads_per_core = cores_per_socket = sockets_per_book = 0;
+		books_per_drawer = drawers = 0;
 		/* s390 detects its cpu topology via /proc/sysinfo, if present.
 		 * Using simply the cpu topology masks in sysfs will not give
 		 * usable results since everything is virtualized. E.g.
@@ -1563,24 +1822,34 @@ print_summary(struct lscpu_desc *desc, struct lscpu_modifier *mod)
 		if (path_exist(_PATH_PROC_SYSINFO)) {
 			FILE *fd = path_fopen("r", 0, _PATH_PROC_SYSINFO);
 			char pbuf[BUFSIZ];
-			int t0, t1, t2;
+			int t0, t1;
 
 			while (fd && fgets(pbuf, sizeof(pbuf), fd) != NULL) {
 				if (sscanf(pbuf, "CPU Topology SW:%d%d%d%d%d%d",
-					   &t0, &t1, &t2, &books, &sockets_per_book,
+					   &t0, &t1, &drawers, &books_per_drawer,
+					   &sockets_per_book,
 					   &cores_per_socket) == 6)
 					break;
 			}
 			if (fd)
 				fclose(fd);
 		}
-		print_n(_("Thread(s) per core:"), desc->nthreads / desc->ncores);
+		if (desc->mtid)
+			threads_per_core = atoi(desc->mtid) + 1;
+		print_n(_("Thread(s) per core:"),
+			threads_per_core ?: desc->nthreads / desc->ncores);
 		print_n(_("Core(s) per socket:"),
 			cores_per_socket ?: desc->ncores / desc->nsockets);
 		if (desc->nbooks) {
 			print_n(_("Socket(s) per book:"),
 				sockets_per_book ?: desc->nsockets / desc->nbooks);
-			print_n(_("Book(s):"), books ?: desc->nbooks);
+			if (desc->ndrawers) {
+				print_n(_("Book(s) per drawer:"),
+					books_per_drawer ?: desc->nbooks / desc->ndrawers);
+				print_n(_("Drawer(s):"), drawers ?: desc->ndrawers);
+			} else {
+				print_n(_("Book(s):"), books_per_drawer ?: desc->nbooks);
+			}
 		} else {
 			print_n(_("Socket(s):"), sockets_per_book ?: desc->nsockets);
 		}
@@ -1589,16 +1858,22 @@ print_summary(struct lscpu_desc *desc, struct lscpu_modifier *mod)
 		print_n(_("NUMA node(s):"), desc->nnodes);
 	if (desc->vendor)
 		print_s(_("Vendor ID:"), desc->vendor);
+	if (desc->machinetype)
+		print_s(_("Machine type:"), desc->machinetype);
 	if (desc->family)
 		print_s(_("CPU family:"), desc->family);
-	if (desc->model)
-		print_s(_("Model:"), desc->model);
-	if (desc->modelname)
-		print_s(_("Model name:"), desc->modelname);
+	if (desc->model || desc->revision)
+		print_s(_("Model:"), desc->revision ? desc->revision : desc->model);
+	if (desc->modelname || desc->cpu)
+		print_s(_("Model name:"), desc->cpu ? desc->cpu : desc->modelname);
 	if (desc->stepping)
 		print_s(_("Stepping:"), desc->stepping);
 	if (desc->mhz)
 		print_s(_("CPU MHz:"), desc->mhz);
+	if (desc->dynamic_mhz)
+		print_s(_("CPU dynamic MHz:"), desc->dynamic_mhz);
+	if (desc->static_mhz)
+		print_s(_("CPU static MHz:"), desc->static_mhz);
 	if (desc->maxmhz)
 		print_s(_("CPU max MHz:"), desc->maxmhz[0]);
 	if (desc->minmhz)
@@ -1629,6 +1904,16 @@ print_summary(struct lscpu_desc *desc, struct lscpu_modifier *mod)
 		}
 	}
 
+	if (desc->necaches) {
+		char cbuf[512];
+
+		for (i = desc->necaches - 1; i >= 0; i--) {
+			snprintf(cbuf, sizeof(cbuf),
+					_("%s cache:"), desc->ecaches[i].name);
+			print_s(cbuf, desc->ecaches[i].size);
+		}
+	}
+
 	for (i = 0; i < desc->nnodes; i++) {
 		snprintf(buf, sizeof(buf), _("NUMA node%d CPU(s):"), desc->idx2nodenum[i]);
 		print_cpuset(buf, desc->nodemaps[i], mod->hex);
@@ -1636,6 +1921,12 @@ print_summary(struct lscpu_desc *desc, struct lscpu_modifier *mod)
 
 	if (desc->flags)
 		print_s(_("Flags:"), desc->flags);
+
+	if (desc->physsockets) {
+		print_n(_("Physical sockets:"), desc->physsockets);
+		print_n(_("Physical chips:"), desc->physchips);
+		print_n(_("Physical cores/chip:"), desc->physcoresperchip);
+	}
 }
 
 static void __attribute__((__noreturn__)) usage(FILE *out)
@@ -1656,6 +1947,7 @@ static void __attribute__((__noreturn__)) usage(FILE *out)
 	fputs(_(" -p, --parse[=<list>]    print out a parsable format\n"), out);
 	fputs(_(" -s, --sysroot <dir>     use specified directory as system root\n"), out);
 	fputs(_(" -x, --hex               print hexadecimal masks rather than lists of CPUs\n"), out);
+	fputs(_(" -y, --physical          print physical instead of logical IDs\n"), out);
 	fputs(USAGE_SEPARATOR, out);
 	fputs(USAGE_HELP, out);
 	fputs(USAGE_VERSION, out);
@@ -1686,6 +1978,7 @@ int main(int argc, char *argv[])
 		{ "extended",	optional_argument, 0, 'e' },
 		{ "parse",	optional_argument, 0, 'p' },
 		{ "sysroot",	required_argument, 0, 's' },
+		{ "physical",	no_argument,	   0, 'y' },
 		{ "hex",	no_argument,	   0, 'x' },
 		{ "version",	no_argument,	   0, 'V' },
 		{ NULL,		0, 0, 0 }
@@ -1703,7 +1996,7 @@ int main(int argc, char *argv[])
 	textdomain(PACKAGE);
 	atexit(close_stdout);
 
-	while ((c = getopt_long(argc, argv, "abce::hp::s:xV", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "abce::hp::s:xyV", longopts, NULL)) != -1) {
 
 		err_exclusive_options(c, longopts, excl, excl_st);
 
@@ -1742,6 +2035,9 @@ int main(int argc, char *argv[])
 		case 'x':
 			mod->hex = 1;
 			break;
+		case 'y':
+			mod->physical = 1;
+			break;
 		case 'V':
 			printf(UTIL_LINUX_VERSION);
 			return EXIT_SUCCESS;
@@ -1770,6 +2066,10 @@ int main(int argc, char *argv[])
 	read_basicinfo(desc, mod);
 
 	for (i = 0; i < desc->ncpuspos; i++) {
+		/* only consider present CPUs */
+		if (desc->present &&
+		    !CPU_ISSET(real_cpu_num(desc, i), desc->present))
+			continue;
 		read_topology(desc, i);
 		read_cache(desc, i);
 		read_polarization(desc, i);
@@ -1781,6 +2081,10 @@ int main(int argc, char *argv[])
 
 	if (desc->caches)
 		qsort(desc->caches, desc->ncaches,
+				sizeof(struct cpu_cache), cachecmp);
+
+	if (desc->ecaches)
+		qsort(desc->ecaches, desc->necaches,
 				sizeof(struct cpu_cache), cachecmp);
 
 	read_nodes(desc);
@@ -1807,6 +2111,8 @@ int main(int argc, char *argv[])
 			columns[ncolumns++] = COL_CPU;
 			if (desc->nodemaps)
 				columns[ncolumns++] = COL_NODE;
+			if (desc->drawermaps)
+				columns[ncolumns++] = COL_DRAWER;
 			if (desc->bookmaps)
 				columns[ncolumns++] = COL_BOOK;
 			if (desc->socketmaps)

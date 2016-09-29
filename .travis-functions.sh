@@ -11,23 +11,15 @@ if [ ! -f "configure.ac" ]; then
 	return 1 || exit 1
 fi
 
-# some config settings
-MAKE="make -j4"
+## some config settings
+# travis docs say we get 1.5 CPUs
+MAKE="make -j2"
 DUMP_CONFIG_LOG="short"
+export TS_OPT_parsable="yes"
 
-# We could test (exotic) out-of-tree build dirs using relative or abs paths.
-# After sourcing this script we are living in build dir. Tasks for source dir
-# have to use $SOURCE_DIR.
-SOURCE_DIR="."
-BUILD_DIR="."
-CONFIGURE="$SOURCE_DIR/configure"
-
-mkdir -p "$BUILD_DIR"
-cd "$BUILD_DIR" || return 1 || exit 1
-
-function configure_travis
+function xconfigure
 {
-	"$CONFIGURE" "$@"
+	./configure "$@" $OSX_CONFOPTS
 	err=$?
 	if [ "$DUMP_CONFIG_LOG" = "short" ]; then
 		grep -B1 -A10000 "^## Output variables" config.log | grep -v "_FALSE="
@@ -41,14 +33,15 @@ function check_nonroot
 {
 	local opts="$MAKE_CHECK_OPTS"
 
-	configure_travis \
+	xconfigure \
 		--disable-use-tty-group \
-		--with-python \
 		--enable-all-programs \
-		--enable-gtk-doc \
 		|| return
 	$MAKE || return
+
+	osx_prepare_check
 	$MAKE check TS_OPTS="$opts" || return
+
 	$MAKE install DESTDIR=/tmp/dest || return
 }
 
@@ -56,59 +49,107 @@ function check_root
 {
 	local opts="$MAKE_CHECK_OPTS --parallel=1"
 
-	configure_travis \
-		--with-python \
+	xconfigure \
 		--enable-all-programs \
 		|| return
 	$MAKE || return
+
 	$MAKE check TS_COMMAND="true" || return
+	osx_prepare_check
 	sudo -E $MAKE check TS_OPTS="$opts" || return
+
 	sudo $MAKE install || return
 }
 
 function check_dist
 {
-	configure_travis \
+	xconfigure \
 		|| return
 	$MAKE distcheck || return
 }
 
 function travis_install_script
 {
+	if [ "$TRAVIS_OS_NAME" = "osx" ]; then
+		osx_install_script
+		return
+	fi
+
 	# install some packages from Ubuntu's default sources
-	sudo apt-get -qq update || return
+	sudo apt-get -qq update
 	sudo apt-get install -qq >/dev/null \
 		bc \
+		btrfs-tools \
 		dnsutils \
 		libcap-ng-dev \
 		libpam-dev \
 		libudev-dev \
 		gtk-doc-tools \
+		mdadm \
 		ntp \
-		|| return
-
-	# install/upgrade custom stuff from non-official sources
-	sudo add-apt-repository -y ppa:malcscott/socat || return
-	sudo apt-get -qq update || return
-	sudo apt-get install -qq >/dev/null \
 		socat \
 		|| return
+
+	# install only if available (e.g. Ubuntu Trusty)
+	sudo apt-get install -qq >/dev/null \
+		libsystemd-daemon-dev \
+		libsystemd-journal-dev \
+		|| true
+}
+
+function osx_install_script
+{
+	brew update >/dev/null
+	brew tap homebrew/dupes
+
+	brew install gettext ncurses socat xz
+	brew link --force gettext
+	brew link --force ncurses
+
+	OSX_CONFOPTS="
+		--disable-runuser \
+		--disable-su \
+		--disable-login \
+		--disable-last \
+		--disable-utmpdump \
+		--disable-agetty \
+		--disable-wall \
+		--disable-ipcrm \
+		--disable-ipcs \
+		--disable-write \
+	"
+
+	# workaround: glibtoolize could not find sed
+	export SED="sed"
+}
+
+function osx_prepare_check
+{
+	[ "$TRAVIS_OS_NAME" = "osx" ] || return 0
+
+	# these ones only need to be gnu for our test-suite
+	brew install coreutils findutils gnu-tar gnu-sed
+
+	# symlink minimally needed gnu commands into PATH
+	mkdir ~/bin
+	for cmd in readlink seq truncate find xargs tar sed; do
+		ln -s /usr/local/bin/g$cmd $HOME/bin/$cmd
+	done
+	hash -r
+
+	export TS_OPT_col_multibyte_known_fail=yes
+	export TS_OPT_colcrt_regressions_known_fail=yes
+	export TS_OPT_column_invalid_multibyte_known_fail=yes
 }
 
 function travis_before_script
 {
-	pushd "$SOURCE_DIR" || return
 	set -o xtrace
 
 	./autogen.sh
 	ret=$?
 
-	# workaround for broken pylibmount install relink
-	[ $ret -eq 0 ] && \
-		sed -i 's/\(link_all_deplibs\)=no/\1=unknown/' ./configure
-
 	set +o xtrace
-	popd
 	return $ret
 }
 
@@ -145,10 +186,10 @@ function travis_after_script
 	local tmp
 
 	# find diff dir from check as well as from distcheck
-	diff_dir=$(find -type d -a -name "diff" | grep "tests/diff" | head -n 1)
+	diff_dir=$(find . -type d -name "diff" | grep "tests/diff" | head -n 1)
 	if [ -d "$diff_dir" ]; then
 		tmp=$(find "$diff_dir" -type f | sort)
 		echo -en "dump test diffs:\n${tmp}\n"
-		echo "$tmp" | xargs -r cat
+		echo "$tmp" | xargs cat
 	fi
 }

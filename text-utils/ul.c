@@ -81,7 +81,7 @@ static void fwd(void);
 static void reverse(void);
 static void initinfo(void);
 static void outc(wint_t c, int width);
-static void setmode(int newmode);
+static void xsetmode(int newmode);
 static void setcol(int newcol);
 static void needcol(int col);
 static void sig_handler(int signo);
@@ -368,7 +368,7 @@ static void flushln(void)
 	for (i = 0; i < maxcol; i++) {
 		if (obuf[i].c_mode != lastmode) {
 			hadmodes++;
-			setmode(obuf[i].c_mode);
+			xsetmode(obuf[i].c_mode);
 			lastmode = obuf[i].c_mode;
 		}
 		if (obuf[i].c_char == '\0') {
@@ -382,7 +382,7 @@ static void flushln(void)
 			i += obuf[i].c_width - 1;
 	}
 	if (lastmode != NORMAL) {
-		setmode(0);
+		xsetmode(0);
 	}
 	if (must_overstrike && hadmodes)
 		overstrike();
@@ -536,7 +536,7 @@ static void initinfo(void)
 
 	/*
 	 * Note that we use REVERSE for the alternate character set,
-	 * not the as/ae capabilities.  This is because we are modelling
+	 * not the as/ae capabilities.  This is because we are modeling
 	 * the model 37 teletype (since that's what nroff outputs) and
 	 * the typical as/ae is more of a graphics set, not the greek
 	 * letters the 37 has.
@@ -560,11 +560,11 @@ static void outc(wint_t c, int width) {
 	}
 }
 
-static void setmode(int newmode)
+static void xsetmode(int newmode)
 {
 	if (!iflag) {
 		if (curmode != NORMAL && newmode != NORMAL)
-			setmode(NORMAL);
+			xsetmode(NORMAL);
 		switch (newmode) {
 		case NORMAL:
 			switch (curmode) {

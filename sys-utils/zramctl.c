@@ -35,6 +35,8 @@
 #include "optutils.h"
 #include "ismounted.h"
 #include "strv.h"
+#include "path.h"
+#include "pathnames.h"
 
 /*#define CONFIG_ZRAM_DEBUG*/
 
@@ -77,7 +79,7 @@ static const struct colinfo infos[] = {
 	[COL_ZEROPAGES] = { "ZERO-PAGES",   3, SCOLS_FL_RIGHT, N_("empty pages with no allocated memory") },
 	[COL_MEMTOTAL]  = { "TOTAL",        5, SCOLS_FL_RIGHT, N_("all memory including allocator fragmentation and metadata overhead") },
 	[COL_MEMLIMIT]  = { "MEM-LIMIT",    5, SCOLS_FL_RIGHT, N_("memory limit used to store compressed data") },
-	[COL_MEMUSED]   = { "MEM-USED",     5, SCOLS_FL_RIGHT, N_("memory zram have consumed to store compressed data") },
+	[COL_MEMUSED]   = { "MEM-USED",     5, SCOLS_FL_RIGHT, N_("memory zram have been consumed to store compressed data") },
 	[COL_MIGRATED]  = { "MIGRATED",     5, SCOLS_FL_RIGHT, N_("number of objects migrated by compaction") },
 	[COL_MOUNTPOINT]= { "MOUNTPOINT",0.10, SCOLS_FL_TRUNC, N_("where the device is mounted") },
 };
@@ -111,7 +113,9 @@ struct zram {
 	struct sysfs_cxt sysfs;
 	char	**mm_stat;
 
-	unsigned int mm_stat_probed : 1;
+	unsigned int mm_stat_probed : 1,
+		     control_probed : 1,
+		     has_control : 1;	/* has /sys/class/zram-control/ */
 };
 
 #define ZRAM_EMPTY	{ .devname = { '\0' }, .sysfs = UL_SYSFSCXT_EMPTY }
@@ -145,6 +149,15 @@ static int column_name_to_id(const char *name, size_t namesz)
 	return -1;
 }
 
+static void zram_reset_stat(struct zram *z)
+{
+	if (z) {
+		strv_free(z->mm_stat);
+		z->mm_stat = NULL;
+		z->mm_stat_probed = 0;
+	}
+}
+
 static void zram_set_devname(struct zram *z, const char *devname, size_t n)
 {
 	assert(z);
@@ -158,6 +171,18 @@ static void zram_set_devname(struct zram *z, const char *devname, size_t n)
 
 	DBG(fprintf(stderr, "set devname: %s", z->devname));
 	sysfs_deinit(&z->sysfs);
+	zram_reset_stat(z);
+}
+
+static int zram_get_devnum(struct zram *z)
+{
+	int n;
+
+	assert(z);
+
+	if (sscanf(z->devname, "/dev/zram%d", &n) == 1)
+		return n;
+	return -EINVAL;
 }
 
 static struct zram *new_zram(const char *devname)
@@ -176,8 +201,7 @@ static void free_zram(struct zram *z)
 		return;
 	DBG(fprintf(stderr, "free: %p", z));
 	sysfs_deinit(&z->sysfs);
-
-	strv_free(z->mm_stat);
+	zram_reset_stat(z);
 	free(z);
 }
 
@@ -192,7 +216,7 @@ static struct sysfs_cxt *zram_get_sysfs(struct zram *z)
 		if (sysfs_init(&z->sysfs, devno, NULL))
 			return NULL;
 		if (*z->devname != '/') {
-			/* cannonicalize the device name according to /sys */
+			/* canonicalize the device name according to /sys */
 			char name[PATH_MAX];
 			if (sysfs_get_devname(&z->sysfs, name, sizeof(name)))
 				snprintf(z->devname, sizeof(z->devname), "/dev/%s", name);
@@ -251,6 +275,50 @@ static int zram_used(struct zram *z)
 	return 0;
 }
 
+static int zram_has_control(struct zram *z)
+{
+	if (!z->control_probed) {
+		z->has_control = access(_PATH_SYS_CLASS "/zram-control/", F_OK) == 0 ? 1 : 0;
+		z->control_probed = 1;
+		DBG(fprintf(stderr, "zram-control: %s", z->has_control ? "yes" : "no"));
+	}
+
+	return z->has_control;
+}
+
+static int zram_control_add(struct zram *z)
+{
+	int n;
+
+	if (!zram_has_control(z))
+		return -ENOSYS;
+
+	n = path_read_s32(_PATH_SYS_CLASS "/zram-control/hot_add");
+	if (n < 0)
+		return n;
+
+	DBG(fprintf(stderr, "hot-add: %d", n));
+	zram_set_devname(z, NULL, n);
+	return 0;
+}
+
+static int zram_control_remove(struct zram *z)
+{
+	char str[sizeof stringify_value(INT_MAX)];
+	int n;
+
+	if (!zram_has_control(z))
+		return -ENOSYS;
+
+	n = zram_get_devnum(z);
+	if (n < 0)
+		return n;
+
+	DBG(fprintf(stderr, "hot-remove: %d", n));
+	snprintf(str, sizeof(str), "%d", n);
+	return path_write_str(str, _PATH_SYS_CLASS "/zram-control/hot_remove");
+}
+
 static struct zram *find_free_zram(void)
 {
 	struct zram *z = new_zram(NULL);
@@ -260,7 +328,7 @@ static struct zram *find_free_zram(void)
 	for (i = 0; isfree == 0; i++) {
 		DBG(fprintf(stderr, "find free: checking zram%zu", i));
 		zram_set_devname(z, NULL, i);
-		if (!zram_exist(z))
+		if (!zram_exist(z) && zram_control_add(z) != 0)
 			break;
 		isfree = !zram_used(z);
 	}
@@ -270,8 +338,6 @@ static struct zram *find_free_zram(void)
 	}
 	return z;
 }
-
-#include "path.h"
 
 static char *get_mm_stat(struct zram *z, size_t idx, int bytes)
 {
@@ -621,6 +687,7 @@ int main(int argc, char **argv)
 				warn(_("%s: failed to reset"), zram->devname);
 				rc = 1;
 			}
+			zram_control_remove(zram);
 			free_zram(zram);
 			optind++;
 		}

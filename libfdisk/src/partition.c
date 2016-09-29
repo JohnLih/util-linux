@@ -2,6 +2,10 @@
 #include "c.h"
 #include "strutils.h"
 
+#ifdef HAVE_LIBBLKID
+# include <blkid.h>
+#endif
+
 #include "fdiskP.h"
 
 /**
@@ -63,6 +67,9 @@ void fdisk_reset_partition(struct fdisk_partition *pa)
 	free(pa->name);
 	free(pa->uuid);
 	free(pa->attrs);
+	free(pa->fstype);
+	free(pa->fsuuid);
+	free(pa->fslabel);
 
 	memset(pa, 0, sizeof(*pa));
 	pa->refcount = ref;
@@ -85,6 +92,13 @@ static struct fdisk_partition *__copy_partition(struct fdisk_partition *o)
 		n->uuid = strdup(o->uuid);
 	if (o->attrs)
 		n->attrs = strdup(o->attrs);
+	if (o->fstype)
+		n->fstype = strdup(o->fstype);
+	if (o->fsuuid)
+		n->fsuuid = strdup(o->fsuuid);
+	if (o->fslabel)
+		n->fslabel = strdup(o->fslabel);
+
 	return n;
 }
 
@@ -92,7 +106,7 @@ static struct fdisk_partition *__copy_partition(struct fdisk_partition *o)
  * fdisk_ref_partition:
  * @pa: partition pointer
  *
- * Incremparts reference counter.
+ * Increments reference counter.
  */
 void fdisk_ref_partition(struct fdisk_partition *pa)
 {
@@ -104,7 +118,7 @@ void fdisk_ref_partition(struct fdisk_partition *pa)
  * fdisk_unref_partition:
  * @pa: partition pointer
  *
- * De-incremparts reference counter, on zero the @pa is automatically
+ * Decrements reference counter, on zero the @pa is automatically
  * deallocated.
  */
 void fdisk_unref_partition(struct fdisk_partition *pa)
@@ -127,7 +141,7 @@ void fdisk_unref_partition(struct fdisk_partition *pa)
  * @off: offset in sectors, maximal is UINT64_MAX-1
  *
  * Note that zero is valid offset too. Use fdisk_partition_unset_start() to
- * undefine the offset. 
+ * undefine the offset.
  *
  * Returns: 0 on success, <0 on error.
  */
@@ -138,6 +152,7 @@ int fdisk_partition_set_start(struct fdisk_partition *pa, fdisk_sector_t off)
 	if (FDISK_IS_UNDEF(off))
 		return -ERANGE;
 	pa->start = off;
+	pa->fs_probed = 0;
 	return 0;
 }
 
@@ -154,6 +169,7 @@ int fdisk_partition_unset_start(struct fdisk_partition *pa)
 	if (!pa)
 		return -EINVAL;
 	FDISK_INIT_UNDEF(pa->start);
+	pa->fs_probed = 0;
 	return 0;
 }
 
@@ -259,6 +275,7 @@ int fdisk_partition_set_size(struct fdisk_partition *pa, fdisk_sector_t sz)
 	if (FDISK_IS_UNDEF(sz))
 		return -ERANGE;
 	pa->size = sz;
+	pa->fs_probed = 0;
 	return 0;
 }
 
@@ -275,6 +292,7 @@ int fdisk_partition_unset_size(struct fdisk_partition *pa)
 	if (!pa)
 		return -EINVAL;
 	FDISK_INIT_UNDEF(pa->size);
+	pa->fs_probed = 0;
 	return 0;
 }
 
@@ -327,7 +345,7 @@ int fdisk_partition_size_explicit(struct fdisk_partition *pa, int enable)
 /**
  * fdisk_partition_set_partno:
  * @pa: partition
- * @num: partitin number (0 is the first partition, maximal is SIZE_MAX-1)
+ * @num: partition number (0 is the first partition, maximal is SIZE_MAX-1)
  *
  * Note that zero is valid partno too. Use fdisk_partition_unset_partno() to
  * undefine the partno.
@@ -426,7 +444,7 @@ int fdisk_partition_partno_follow_default(struct fdisk_partition *pa, int enable
  * @pa: partition
  * @type: partition type
  *
- * Sets parititon type.
+ * Sets partition type.
  *
  * Returns: 0 on success, <0 on error.
  */
@@ -724,6 +742,60 @@ int fdisk_partition_next_partno(
 	return 0;
 }
 
+static int probe_partition_content(struct fdisk_context *cxt, struct fdisk_partition *pa)
+{
+	int rc = 1;	/* nothing */
+
+	DBG(PART, ul_debugobj(pa, "start probe #%zu partition [cxt %p] >>>", pa->partno, cxt));
+
+	/* zeroize the current setting */
+	strdup_to_struct_member(pa, fstype, NULL);
+	strdup_to_struct_member(pa, fsuuid, NULL);
+	strdup_to_struct_member(pa, fslabel, NULL);
+
+	if (!fdisk_partition_has_start(pa) ||
+	    !fdisk_partition_has_size(pa))
+		goto done;
+
+#ifdef HAVE_LIBBLKID
+	else {
+		uintmax_t start, size;
+
+		blkid_probe pr = blkid_new_probe();
+		if (!pr)
+			goto done;
+
+		DBG(PART, ul_debugobj(pa, "blkid prober: %p", pr));
+
+		start = fdisk_partition_get_start(pa) * fdisk_get_sector_size(cxt);
+		size = fdisk_partition_get_size(pa) * fdisk_get_sector_size(cxt);
+
+		if (blkid_probe_set_device(pr, cxt->dev_fd, start, size) == 0
+		    && blkid_do_fullprobe(pr) == 0) {
+
+			const char *data;
+			rc = 0;
+
+			if (!blkid_probe_lookup_value(pr, "TYPE",  &data, NULL))
+				rc = strdup_to_struct_member(pa, fstype, data);
+
+			if (!rc && !blkid_probe_lookup_value(pr, "LABEL", &data, NULL))
+				rc = strdup_to_struct_member(pa, fslabel, data);
+
+			if (!rc && !blkid_probe_lookup_value(pr, "UUID",  &data, NULL))
+				rc = strdup_to_struct_member(pa, fsuuid, data);
+		}
+
+		blkid_free_probe(pr);
+		pa->fs_probed = 1;
+	}
+#endif /* HAVE_LIBBLKID */
+
+done:
+	DBG(PART, ul_debugobj(pa, "<<< end probe #%zu partition[cxt %p, rc=%d]", pa->partno, cxt, rc));
+	return rc;
+}
+
 /**
  * fdisk_partition_to_string:
  * @pa: partition
@@ -736,7 +808,7 @@ int fdisk_partition_next_partno(
  * For example
  * <informalexample>
  *   <programlisting>
- *      struct fdisk_parition *pa;
+ *      struct fdisk_partition *pa;
  *
  *      fdisk_get_partition(cxt, 0, &pa);
  *	fdisk_partition_to_string(pa, FDISK_FIELD_UUID, &data);
@@ -780,16 +852,16 @@ int fdisk_partition_to_string(struct fdisk_partition *pa,
 		if (fdisk_partition_has_start(pa)) {
 			x = fdisk_cround(cxt, pa->start);
 			rc = pa->start_post ?
-				asprintf(&p, "%ju%c", x, pa->start_post) :
-				asprintf(&p, "%ju", x);
+				asprintf(&p, "%"PRIu64"%c", x, pa->start_post) :
+				asprintf(&p, "%"PRIu64, x);
 		}
 		break;
 	case FDISK_FIELD_END:
 		if (fdisk_partition_has_end(pa)) {
 			x = fdisk_cround(cxt, fdisk_partition_get_end(pa));
 			rc = pa->end_post ?
-					asprintf(&p, "%ju%c", x, pa->end_post) :
-					asprintf(&p, "%ju", x);
+					asprintf(&p, "%"PRIu64"%c", x, pa->end_post) :
+					asprintf(&p, "%"PRIu64, x);
 		}
 		break;
 	case FDISK_FIELD_SIZE:
@@ -798,13 +870,13 @@ int fdisk_partition_to_string(struct fdisk_partition *pa,
 
 			switch (cxt->sizeunit) {
 			case FDISK_SIZEUNIT_BYTES:
-				rc = asprintf(&p, "%ju", sz);
+				rc = asprintf(&p, "%"PRIu64"", sz);
 				break;
 			case FDISK_SIZEUNIT_HUMAN:
 				if (fdisk_is_details(cxt))
 					rc = pa->size_post ?
-							asprintf(&p, "%ju%c", sz, pa->size_post) :
-							asprintf(&p, "%ju", sz);
+							asprintf(&p, "%"PRIu64"%c", sz, pa->size_post) :
+							asprintf(&p, "%"PRIu64, sz);
 				else {
 					p = size_to_human_string(SIZE_SUFFIX_1LETTER, sz);
 					if (!p)
@@ -818,7 +890,8 @@ int fdisk_partition_to_string(struct fdisk_partition *pa,
 	{
 		uintmax_t sz = fdisk_partition_has_size(pa) ? pa->size : 0;
 		if (sz)
-			rc = asprintf(&p, "%ju", (sz / (cxt->geom.heads * cxt->geom.sectors)) + 1);
+			/* Why we need to cast that to uintmax_t? */
+			rc = asprintf(&p, "%ju", (uintmax_t)(sz / (cxt->geom.heads * cxt->geom.sectors)) + 1);
 		break;
 	}
 	case FDISK_FIELD_SECTORS:
@@ -826,13 +899,13 @@ int fdisk_partition_to_string(struct fdisk_partition *pa,
 			fdisk_partition_has_size(pa) ? (uintmax_t) pa->size : 0);
 		break;
 	case FDISK_FIELD_BSIZE:
-		rc = asprintf(&p, "%ju", pa->bsize);
+		rc = asprintf(&p, "%"PRIu64, pa->bsize);
 		break;
 	case FDISK_FIELD_FSIZE:
-		rc = asprintf(&p, "%ju", pa->fsize);
+		rc = asprintf(&p, "%"PRIu64, pa->fsize);
 		break;
 	case FDISK_FIELD_CPG:
-		rc = asprintf(&p, "%ju", pa->cpg);
+		rc = asprintf(&p, "%"PRIu64, pa->cpg);
 		break;
 	case FDISK_FIELD_TYPE:
 		p = pa->type && pa->type->name ? strdup(_(pa->type->name)) : NULL;
@@ -858,6 +931,18 @@ int fdisk_partition_to_string(struct fdisk_partition *pa,
 	case FDISK_FIELD_EADDR:
 		p = pa->end_chs && *pa->end_chs? strdup(pa->end_chs) : NULL;
 		break;
+	case FDISK_FIELD_FSUUID:
+		if (pa->fs_probed || probe_partition_content(cxt, pa) == 0)
+			p = pa->fsuuid && *pa->fsuuid ? strdup(pa->fsuuid) : NULL;
+		break;
+	case FDISK_FIELD_FSLABEL:
+		if (pa->fs_probed || probe_partition_content(cxt, pa) == 0)
+			p = pa->fslabel && *pa->fslabel ? strdup(pa->fslabel) : NULL;
+		break;
+	case FDISK_FIELD_FSTYPE:
+		if (pa->fs_probed || probe_partition_content(cxt, pa) == 0)
+			p = pa->fstype && *pa->fstype ? strdup(pa->fstype) : NULL;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -874,6 +959,7 @@ int fdisk_partition_to_string(struct fdisk_partition *pa,
 
 	return rc;
 }
+
 
 /**
  * fdisk_get_partition:
@@ -971,13 +1057,17 @@ static int resize_get_last_possible(
 		    fdisk_partition_is_container(pa))
 			continue;
 
+		DBG(PART, ul_debugobj(pa, "checking start=%ju, size=%ju",
+		                      (uintmax_t)pa->start, (uintmax_t)pa->size));
+
 		if (!last) {
 			if (start >= pa->start &&  start < pa->start + pa->size) {
 				if (fdisk_partition_is_freespace(pa) || pa == cur)
 					last = pa;
 				else
 					break;
-				*maxsz = pa->size - (pa->start - start);
+
+				*maxsz = pa->size - (start - pa->start);
 			}
 		} else if (!fdisk_partition_is_freespace(pa) && pa != cur) {
 			break;
@@ -989,8 +1079,10 @@ static int resize_get_last_possible(
 
 	if (last)
 		DBG(PART, ul_debugobj(cur, "resize: max size=%ju", (uintmax_t) *maxsz));
-	return last ? 0 : -1;
+	else
+		DBG(PART, ul_debugobj(cur, "resize: nothing usable after %ju", (uintmax_t) start));
 
+	return last ? 0 : -1;
 }
 
 /*
@@ -1001,12 +1093,12 @@ static int recount_resize(
 			struct fdisk_context *cxt, size_t partno,
 			struct fdisk_partition *res, struct fdisk_partition *tpl)
 {
-	fdisk_sector_t start, size;
+	fdisk_sector_t start, size, xsize;
 	struct fdisk_partition *cur = NULL;
 	struct fdisk_table *tb = NULL;
 	int rc;
 
-	DBG(PART, ul_debugobj(tpl, "resize requested"));
+	DBG(PART, ul_debugobj(tpl, ">>> resize requested"));
 
 	FDISK_INIT_UNDEF(start);
 	FDISK_INIT_UNDEF(size);
@@ -1033,9 +1125,15 @@ static int recount_resize(
 		} else
 			start += fdisk_partition_get_start(tpl);
 
+		DBG(PART, ul_debugobj(tpl, "resize: moving start %s relative, new start: %ju",
+				tpl->movestart == FDISK_MOVE_DOWN  ? "DOWN" : "UP", (uintmax_t)start));
+
 	/* 1b) set new start - absolute number */
-	} else if (fdisk_partition_has_start(tpl))
+	} else if (fdisk_partition_has_start(tpl)) {
 		start = fdisk_partition_get_start(tpl);
+		DBG(PART, ul_debugobj(tpl, "resize: moving start to absolute offset: %ju",
+		                      (uintmax_t)start));
+	}
 
 	/* 2) verify that start is within the current partition or any freespace area */
 	if (!FDISK_IS_UNDEF(start)) {
@@ -1050,6 +1148,7 @@ static int recount_resize(
 			goto erange;
 	} else {
 		/* no change, start points to the current partition */
+		DBG(PART, ul_debugobj(tpl, "resize: start unchanged"));
 		start = fdisk_partition_get_start(cur);
 	}
 
@@ -1080,17 +1179,25 @@ static int recount_resize(
 	}
 
 	/* 4) verify that size is within the current partition or next free space */
-	if (!FDISK_IS_UNDEF(size)) {
+	xsize = !FDISK_IS_UNDEF(size) ? size : fdisk_partition_get_size(cur);
+
+	if (fdisk_partition_has_size(cur)) {
 		fdisk_sector_t maxsz;
+
 		if (resize_get_last_possible(tb, cur, start, &maxsz))
 			goto erange;
-		DBG(PART, ul_debugobj(tpl, "resize: size wanted=%ju, max=%ju",
-					(uintmax_t) size, (uintmax_t) maxsz));
-		if (size > maxsz)
+		DBG(PART, ul_debugobj(tpl, "resize: size=%ju, max=%ju",
+					(uintmax_t) xsize, (uintmax_t) maxsz));
+		if (xsize > maxsz)
 			goto erange;
 	}
 
-	DBG(PART, ul_debugobj(tpl, "resize: SUCCESS: start %ju->%ju; size %ju->%ju",
+	if (!FDISK_IS_UNDEF(size)) {
+		DBG(PART, ul_debugobj(tpl, "resize: size unchanged (undefined)"));
+	}
+
+
+	DBG(PART, ul_debugobj(tpl, "<<< resize: SUCCESS: start %ju->%ju; size %ju->%ju",
 			(uintmax_t) fdisk_partition_get_start(cur), (uintmax_t) start,
 			(uintmax_t) fdisk_partition_get_size(cur), (uintmax_t) size));
 	res->start = start;
@@ -1098,7 +1205,7 @@ static int recount_resize(
 	fdisk_unref_table(tb);
 	return 0;
 erange:
-	DBG(PART, ul_debugobj(tpl, "resize: FAILED"));
+	DBG(PART, ul_debugobj(tpl, "<<< resize: FAILED"));
 	fdisk_warnx(cxt, _("Failed to resize partition #%zu."), partno + 1);
 	fdisk_unref_table(tb);
 	return -ERANGE;
@@ -1118,13 +1225,20 @@ erange:
 int fdisk_set_partition(struct fdisk_context *cxt, size_t partno,
 			struct fdisk_partition *pa)
 {
-	struct fdisk_partition *xpa = pa;
-	int rc;
+	struct fdisk_partition *xpa = pa, *tmp = NULL;
+	int rc, wipe = 0;
 
 	if (!cxt || !cxt->label || !pa)
 		return -EINVAL;
 	if (!cxt->label->op->set_part)
 		return -ENOSYS;
+
+	pa->fs_probed = 0;
+
+	if (!fdisk_is_partition_used(cxt, partno)) {
+		pa->partno = partno;
+		return fdisk_add_partition(cxt, pa, NULL);
+	}
 
 	if (pa->resize || fdisk_partition_has_start(pa) || fdisk_partition_has_size(pa)) {
 		xpa = __copy_partition(pa);
@@ -1144,11 +1258,50 @@ int fdisk_set_partition(struct fdisk_context *cxt, size_t partno,
 		    (uintmax_t) fdisk_partition_get_end(xpa),
 		    (uintmax_t) fdisk_partition_get_size(xpa)));
 
+	/* disable wipe for old offset/size setting */
+	if (fdisk_get_partition(cxt, partno, &tmp) == 0 && tmp) {
+		wipe = fdisk_set_wipe_area(cxt, fdisk_partition_get_start(tmp),
+						fdisk_partition_get_size(tmp), FALSE);
+		fdisk_unref_partition(tmp);
+	}
+
+	/* call label driver */
 	rc = cxt->label->op->set_part(cxt, partno, xpa);
+
+	/* enable wipe for new offset/size */
+	if (!rc && wipe)
+		fdisk_wipe_partition(cxt, partno, TRUE);
 done:
+	DBG(CXT, ul_debugobj(cxt, "set_partition() rc=%d", rc));
 	if (xpa != pa)
 		fdisk_unref_partition(xpa);
 	return rc;
+}
+
+/**
+ * fdisk_wipe_partition:
+ * @cxt: fdisk context
+ * @partno: partition number
+ * @enable: 0 or 1
+ *
+ * Enable/disable filesystems/RAIDs wiping in area defined by partition start and size.
+ *
+ * Returns: <0 in case of error, 0 on success
+ * Since: 2.29
+ */
+int fdisk_wipe_partition(struct fdisk_context *cxt, size_t partno, int enable)
+{
+	struct fdisk_partition *pa = NULL;
+	int rc;
+
+	rc = fdisk_get_partition(cxt, partno, &pa);
+	if (rc)
+		return rc;
+
+	rc = fdisk_set_wipe_area(cxt, fdisk_partition_get_start(pa),
+				      fdisk_partition_get_size(pa), enable);
+	fdisk_unref_partition(pa);
+	return rc < 0 ? rc : 0;
 }
 
 
@@ -1158,7 +1311,7 @@ done:
  * @pa: template for the partition (or NULL)
  * @partno: NULL or returns new partition number
  *
- * If @pa is not specified or any @pa item is missiong the libfdisk will ask by
+ * If @pa is not specified or any @pa item is missing the libfdisk will ask by
  * fdisk_ask_ API.
  *
  * Adds a new partition to disklabel.
@@ -1178,7 +1331,8 @@ int fdisk_add_partition(struct fdisk_context *cxt,
 	if (fdisk_missing_geometry(cxt))
 		return -EINVAL;
 
-	if (pa)
+	if (pa) {
+		pa->fs_probed = 0;
 		DBG(CXT, ul_debugobj(cxt, "adding new partition %p (start=%ju, end=%ju, size=%ju, "
 			    "defaults(start=%s, end=%s, partno=%s)",
 			    pa,
@@ -1188,7 +1342,7 @@ int fdisk_add_partition(struct fdisk_context *cxt,
 			    pa->start_follow_default ? "yes" : "no",
 			    pa->end_follow_default ? "yes" : "no",
 			    pa->partno_follow_default ? "yes" : "no"));
-	else
+	} else
 		DBG(CXT, ul_debugobj(cxt, "adding partition"));
 
 	rc = cxt->label->op->add_part(cxt, pa, partno);
@@ -1212,6 +1366,8 @@ int fdisk_delete_partition(struct fdisk_context *cxt, size_t partno)
 		return -EINVAL;
 	if (!cxt->label->op->del_part)
 		return -ENOSYS;
+
+	fdisk_wipe_partition(cxt, partno, 0);
 
 	DBG(CXT, ul_debugobj(cxt, "deleting %s partition number %zd",
 				cxt->label->name, partno));

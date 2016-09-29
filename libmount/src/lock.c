@@ -508,11 +508,11 @@ failed:
  *
  *   1. create linkfile (e.g. /etc/mtab~.$PID)
  *   2. link linkfile --> lockfile (e.g. /etc/mtab~.$PID --> /etc/mtab~)
- *   3. a) link() success: setups F_SETLK lock (see fcnlt(2))
+ *   3. a) link() success: setups F_SETLK lock (see fcntl(2))
  *      b) link() failed:  wait (max 30s) on F_SETLKW lock, goto 2.
  *
  * Note that when the lock is used by mnt_update_table() interface then libmount
- * uses flock() for private library file /run/mount/utab. The fcnlt(2) is used only
+ * uses flock() for private library file /run/mount/utab. The fcntl(2) is used only
  * for backwardly compatible stuff like /etc/mtab.
  *
  * Returns: 0 on success or negative number in case of error (-ETIMEOUT is case
@@ -566,7 +566,7 @@ struct libmnt_lock *lock;
  * read number from @filename, increment the number and
  * write the number back to the file
  */
-void increment_data(const char *filename, int verbose, int loopno)
+static void increment_data(const char *filename, int verbose, int loopno)
 {
 	long num;
 	FILE *f;
@@ -594,7 +594,7 @@ void increment_data(const char *filename, int verbose, int loopno)
 				filename, num - 1, num, loopno);
 }
 
-void clean_lock(void)
+static void clean_lock(void)
 {
 	if (!lock)
 		return;
@@ -602,12 +602,12 @@ void clean_lock(void)
 	mnt_free_lock(lock);
 }
 
-void __attribute__((__noreturn__)) sig_handler(int sig)
+static void __attribute__((__noreturn__)) sig_handler(int sig)
 {
 	errx(EXIT_FAILURE, "\n%d: catch signal: %s\n", getpid(), strsignal(sig));
 }
 
-int test_lock(struct libmnt_test *ts, int argc, char *argv[])
+static int test_lock(struct libmnt_test *ts, int argc, char *argv[])
 {
 	time_t synctime = 0;
 	unsigned int usecs;

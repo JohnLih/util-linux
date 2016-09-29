@@ -13,7 +13,7 @@ Stepping:              5
 CPU MHz:               1199.000
 CPU max MHz:           2667.0000
 CPU min MHz:           1199.0000
-BogoMIPS:              5319.97
+BogoMIPS:              5319.92
 Virtualization:        VT-x
 L1d cache:             32K
 L1i cache:             32K
@@ -30,3 +30,12 @@ Flags:                 fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca 
 1,1,0,0,,1,1,1,0
 2,0,0,0,,0,0,0,0
 3,1,0,0,,1,1,1,0
+
+# The following is the parsable format, which can be fed to other
+# programs. Each different item in every column has an unique ID
+# starting from zero.
+# CPU,Core,Socket,Node,,L1d,L1i,L2,L3
+0,0,0,0,,0,0,0,0
+1,2,0,0,,1,1,1,0
+2,0,0,0,,0,0,0,0
+3,2,0,0,,1,1,1,0

@@ -48,16 +48,19 @@ static struct namespace_file {
 } namespace_files[] = {
 	/* Careful the order is significant in this array.
 	 *
-	 * The user namespace comes first, so that it is entered
-	 * first.  This gives an unprivileged user the potential to
-	 * enter the other namespaces.
+	 * The user namespace comes either first or last: first if
+	 * you're using it to increase your privilege and last if
+	 * you're using it to decrease.  We enter the namespaces in
+	 * two passes starting initially from offset 1 and then offset
+	 * 0 if that fails.
 	 */
-	{ .nstype = CLONE_NEWUSER, .name = "ns/user", .fd = -1 },
-	{ .nstype = CLONE_NEWIPC,  .name = "ns/ipc",  .fd = -1 },
-	{ .nstype = CLONE_NEWUTS,  .name = "ns/uts",  .fd = -1 },
-	{ .nstype = CLONE_NEWNET,  .name = "ns/net",  .fd = -1 },
-	{ .nstype = CLONE_NEWPID,  .name = "ns/pid",  .fd = -1 },
-	{ .nstype = CLONE_NEWNS,   .name = "ns/mnt",  .fd = -1 },
+	{ .nstype = CLONE_NEWUSER,  .name = "ns/user", .fd = -1 },
+	{ .nstype = CLONE_NEWCGROUP,.name = "ns/cgroup", .fd = -1 },
+	{ .nstype = CLONE_NEWIPC,   .name = "ns/ipc",  .fd = -1 },
+	{ .nstype = CLONE_NEWUTS,   .name = "ns/uts",  .fd = -1 },
+	{ .nstype = CLONE_NEWNET,   .name = "ns/net",  .fd = -1 },
+	{ .nstype = CLONE_NEWPID,   .name = "ns/pid",  .fd = -1 },
+	{ .nstype = CLONE_NEWNS,    .name = "ns/mnt",  .fd = -1 },
 	{ .nstype = 0, .name = NULL, .fd = -1 }
 };
 
@@ -79,6 +82,7 @@ static void usage(int status)
 	fputs(_(" -i, --ipc[=<file>]     enter System V IPC namespace\n"), out);
 	fputs(_(" -n, --net[=<file>]     enter network namespace\n"), out);
 	fputs(_(" -p, --pid[=<file>]     enter pid namespace\n"), out);
+	fputs(_(" -C, --cgroup[=<file>]  enter cgroup namespace\n"), out);
 	fputs(_(" -U, --user[=<file>]    enter user namespace\n"), out);
 	fputs(_(" -S, --setuid <uid>     set uid in entered namespace\n"), out);
 	fputs(_(" -G, --setgid <gid>     set gid in entered namespace\n"), out);
@@ -186,6 +190,7 @@ int main(int argc, char *argv[])
 		{ "net", optional_argument, NULL, 'n' },
 		{ "pid", optional_argument, NULL, 'p' },
 		{ "user", optional_argument, NULL, 'U' },
+		{ "cgroup", optional_argument, NULL, 'C' },
 		{ "setuid", required_argument, NULL, 'S' },
 		{ "setgid", required_argument, NULL, 'G' },
 		{ "root", optional_argument, NULL, 'r' },
@@ -199,7 +204,7 @@ int main(int argc, char *argv[])
 	};
 
 	struct namespace_file *nsfile;
-	int c, namespaces = 0, setgroups_nerrs = 0, preserve_cred = 0;
+	int c, pass, namespaces = 0, setgroups_nerrs = 0, preserve_cred = 0;
 	bool do_rd = false, do_wd = false, force_uid = false, force_gid = false;
 	int do_fork = -1; /* unknown yet */
 	uid_t uid = 0;
@@ -214,7 +219,7 @@ int main(int argc, char *argv[])
 	atexit(close_stdout);
 
 	while ((c =
-		getopt_long(argc, argv, "+hVt:m::u::i::n::p::U::S:G:r::w::FZ",
+		getopt_long(argc, argv, "+hVt:m::u::i::n::p::C::U::S:G:r::w::FZ",
 			    longopts, NULL)) != -1) {
 		switch (c) {
 		case 'h':
@@ -255,6 +260,12 @@ int main(int argc, char *argv[])
 				open_namespace_fd(CLONE_NEWPID, optarg);
 			else
 				namespaces |= CLONE_NEWPID;
+			break;
+		case 'C':
+			if (optarg)
+				open_namespace_fd(CLONE_NEWCGROUP, optarg);
+			else
+				namespaces |= CLONE_NEWCGROUP;
 			break;
 		case 'U':
 			if (optarg)
@@ -344,19 +355,31 @@ int main(int argc, char *argv[])
 	}
 
 	/*
-	 * Now that we know which namespaces we want to enter, enter them.
+	 * Now that we know which namespaces we want to enter, enter
+	 * them.  Do this in two passes, not entering the user
+	 * namespace on the first pass.  So if we're deprivileging the
+	 * container we'll enter the user namespace last and if we're
+	 * privileging it then we enter the user namespace first
+	 * (because the initial setns will fail).
 	 */
-	for (nsfile = namespace_files; nsfile->nstype; nsfile++) {
-		if (nsfile->fd < 0)
-			continue;
-		if (nsfile->nstype == CLONE_NEWPID && do_fork == -1)
-			do_fork = 1;
-		if (setns(nsfile->fd, nsfile->nstype))
-			err(EXIT_FAILURE,
-			    _("reassociate to namespace '%s' failed"),
-			    nsfile->name);
-		close(nsfile->fd);
-		nsfile->fd = -1;
+	for (pass = 0; pass < 2; pass ++) {
+		for (nsfile = namespace_files + 1 - pass; nsfile->nstype; nsfile++) {
+			if (nsfile->fd < 0)
+				continue;
+			if (nsfile->nstype == CLONE_NEWPID && do_fork == -1)
+				do_fork = 1;
+			if (setns(nsfile->fd, nsfile->nstype)) {
+				if (pass != 0)
+					err(EXIT_FAILURE,
+					    _("reassociate to namespace '%s' failed"),
+					    nsfile->name);
+				else
+					continue;
+			}
+
+			close(nsfile->fd);
+			nsfile->fd = -1;
+		}
 	}
 
 	/* Remember the current working directory if I'm not changing it */

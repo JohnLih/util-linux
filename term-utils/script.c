@@ -62,6 +62,7 @@
 #include <poll.h>
 #include <sys/signalfd.h>
 #include <assert.h>
+#include <inttypes.h>
 
 #include "closestream.h"
 #include "nls.h"
@@ -121,7 +122,6 @@ struct script_control {
 	 timing:1,		/* include timing file */
 	 force:1,		/* write output to links */
 	 isterm:1,		/* is child process running as terminal */
-	 data_on_way:1,		/* sent data to master */
 	 die:1;			/* terminate program */
 
 	sigset_t sigset;	/* catch SIGCHLD and SIGWINCH with signalfd() */
@@ -141,11 +141,13 @@ static void script_init_debug(void)
 static inline time_t script_time(time_t *t)
 {
 	const char *str = getenv("SCRIPT_TEST_SECOND_SINCE_EPOCH");
-	time_t sec;
+	int64_t sec;
 
-	if (str && sscanf(str, "%ld", &sec) == 1)
-		return sec;
-	return time(t);
+	if (!str || sscanf(str, "%"SCNi64, &sec) != 1)
+		return time(t);
+	if (t)
+		*t = (time_t)sec;
+	return (time_t)sec;
 }
 #else	/* !TEST_SCRIPT */
 # define script_time(x) time(x)
@@ -193,7 +195,7 @@ static void __attribute__((__noreturn__)) done(struct script_control *ctl)
 
 	if (ctl->isterm)
 		tcsetattr(STDIN_FILENO, TCSADRAIN, &ctl->attrs);
-	if (!ctl->quiet)
+	if (!ctl->quiet && ctl->typescriptfp)
 		printf(_("Script done, file is %s\n"), ctl->fname);
 #ifdef HAVE_LIBUTEMPTER
 	if (ctl->master >= 0)
@@ -201,9 +203,10 @@ static void __attribute__((__noreturn__)) done(struct script_control *ctl)
 #endif
 	kill(ctl->child, SIGTERM);	/* make sure we don't create orphans */
 
-	if (ctl->timingfp)
-		fclose(ctl->timingfp);
-	fclose(ctl->typescriptfp);
+	if (ctl->timingfp && close_stream(ctl->timingfp) != 0)
+		err(EXIT_FAILURE, "write failed: %s", ctl->tname);
+	if (ctl->typescriptfp && close_stream(ctl->typescriptfp) != 0)
+		err(EXIT_FAILURE, "write failed: %s", ctl->fname);
 
 	if (ctl->rc_wanted) {
 		if (WIFSIGNALED(ctl->childstatus))
@@ -246,7 +249,8 @@ static void write_output(struct script_control *ctl, char *obuf,
 
 		gettime_monotonic(&now);
 		timersub(&now, &ctl->oldtime, &delta);
-		fprintf(ctl->timingfp, "%ld.%06ld %zd\n", delta.tv_sec, delta.tv_usec, bytes);
+		fprintf(ctl->timingfp, "%ld.%06ld %zd\n",
+		        (long)delta.tv_sec, (long)delta.tv_usec, bytes);
 		if (ctl->flush)
 			fflush(ctl->timingfp);
 		ctl->oldtime = now;
@@ -272,44 +276,45 @@ static void write_output(struct script_control *ctl, char *obuf,
 	DBG(IO, ul_debug("  writing output *done*"));
 }
 
-static void wait_for_empty_fd(int fd)
+static int write_to_shell(struct script_control *ctl,
+			  char *buf, size_t bufsz)
 {
-	struct pollfd fds[] = {
-	           { .fd = fd, .events = POLLIN }
-	};
-
-	while (poll(fds, 1, 10) == 1) {
-		DBG(IO, ul_debug("  data to read"));
-	}
+	return write_all(ctl->master, buf, bufsz);
 }
 
 /*
- * The script(1) is usually faster than shell, so it's good idea to wait until
- * the previous message is has been already read by shell from slave before we
- * wrate to master. This is necessary expecially for EOF situation when we can
+ * The script(1) is usually faster than shell, so it's a good idea to wait until
+ * the previous message has been already read by shell from slave before we
+ * write to master. This is necessary especially for EOF situation when we can
  * send EOF to master before shell is fully initialized, to workaround this
  * problem we wait until slave is empty. For example:
  *
  *   echo "date" | script
+ *
+ * Unfortunately, the child (usually shell) can ignore stdin at all, so we
+ * don't wait forever to avoid dead locks...
+ *
+ * Note that script is primarily designed for interactive sessions as it
+ * maintains master+slave tty stuff within the session. Use pipe to write to
+ * script(1) and assume non-interactive (tee-like) behavior is NOT well
+ * supported.
  */
-static int write_to_shell(struct script_control *ctl, char *buf, size_t bufsz)
-{
-	int rc;
-
-	if (ctl->data_on_way) {
-		wait_for_empty_fd(ctl->slave);
-		ctl->data_on_way = 0;
-	}
-	rc = write_all(ctl->master, buf, bufsz);
-	if (rc == 0)
-		ctl->data_on_way = 1;
-	return rc;
-
-}
-
 static void write_eof_to_shell(struct script_control *ctl)
 {
+	unsigned int tries = 0;
+	struct pollfd fds[] = {
+	           { .fd = ctl->slave, .events = POLLIN }
+	};
 	char c = DEF_EOF;
+
+	DBG(IO, ul_debug(" waiting for empty slave"));
+	while (poll(fds, 1, 10) == 1 && tries < 8) {
+		DBG(IO, ul_debug("   slave is not empty"));
+		xusleep(250000);
+		tries++;
+	}
+	if (tries < 8)
+		DBG(IO, ul_debug("   slave is empty now"));
 
 	DBG(IO, ul_debug(" sending EOF to master"));
 	write_to_shell(ctl, &c, sizeof(char));
@@ -371,10 +376,12 @@ static void handle_signal(struct script_control *ctl, int fd)
 
 	switch (info.ssi_signo) {
 	case SIGCHLD:
+		DBG(SIGNAL, ul_debug(" get signal SIGCHLD"));
 		wait_for_child(ctl, 0);
 		ctl->poll_timeout = 10;
 		return;
 	case SIGWINCH:
+		DBG(SIGNAL, ul_debug(" get signal SIGWINCH"));
 		if (ctl->isterm) {
 			ioctl(STDIN_FILENO, TIOCGWINSZ, (char *)&ctl->win);
 			ioctl(ctl->slave, TIOCSWINSZ, (char *)&ctl->win);
@@ -385,6 +392,7 @@ static void handle_signal(struct script_control *ctl, int fd)
 	case SIGINT:
 		/* fallthrough */
 	case SIGQUIT:
+		DBG(SIGNAL, ul_debug(" get signal SIG{TERM,INT,QUIT}"));
 		fprintf(stderr, _("\nSession terminated.\n"));
 		/* Child termination is going to generate SIGCHILD (see above) */
 		kill(ctl->child, SIGTERM);
@@ -412,15 +420,16 @@ static void do_io(struct script_control *ctl)
 	};
 
 
-	if ((ctl->typescriptfp = fopen(ctl->fname, ctl->append ? "a" : "w")) == NULL) {
+	if ((ctl->typescriptfp =
+	     fopen(ctl->fname, ctl->append ? "a" UL_CLOEXECSTR : "w" UL_CLOEXECSTR)) == NULL) {
 		warn(_("cannot open %s"), ctl->fname);
 		fail(ctl);
 	}
 	if (ctl->timing) {
 		if (!ctl->tname) {
-			if (!(ctl->timingfp = fopen("/dev/stderr", "w")))
+			if (!(ctl->timingfp = fopen("/dev/stderr", "w" UL_CLOEXECSTR)))
 				err(EXIT_FAILURE, _("cannot open %s"), "/dev/stderr");
-		} else if (!(ctl->timingfp = fopen(ctl->tname, "w")))
+		} else if (!(ctl->timingfp = fopen(ctl->tname, "w" UL_CLOEXECSTR)))
 			err(EXIT_FAILURE, _("cannot open %s"), ctl->tname);
 	}
 
@@ -481,6 +490,7 @@ static void do_io(struct script_control *ctl)
 					if (i == POLLFD_STDIN) {
 						ignore_stdin = 1;
 						write_eof_to_shell(ctl);
+						DBG(POLL, ul_debug("  ignore STDIN"));
 					}
 				}
 				continue;
@@ -507,7 +517,7 @@ static void getslave(struct script_control *ctl)
 {
 #ifndef HAVE_LIBUTIL
 	ctl->line[strlen("/dev/")] = 't';
-	ctl->slave = open(ctl->line, O_RDWR);
+	ctl->slave = open(ctl->line, O_RDWR | O_CLOEXEC);
 	if (ctl->slave < 0) {
 		warn(_("cannot open %s"), ctl->line);
 		fail(ctl);
@@ -606,7 +616,6 @@ static void getmaster(struct script_control *ctl)
 	}
 #else
 	char *pty, *bank, *cp;
-	struct stat stb;
 
 	ctl->isterm = isatty(STDIN_FILENO);
 
@@ -614,11 +623,11 @@ static void getmaster(struct script_control *ctl)
 	for (bank = "pqrs"; *bank; bank++) {
 		ctl->line[strlen("/dev/pty")] = *bank;
 		*pty = '0';
-		if (stat(ctl->line, &stb) < 0)
+		if (access(ctl->line, F_OK) != 0)
 			break;
 		for (cp = "0123456789abcdef"; *cp; cp++) {
 			*pty = *cp;
-			ctl->master = open(ctl->line, O_RDWR);
+			ctl->master = open(ctl->line, O_RDWR | O_CLOEXEC);
 			if (ctl->master >= 0) {
 				char *tp = &ctl->line[strlen("/dev/")];
 				int ok;
@@ -758,7 +767,7 @@ int main(int argc, char **argv)
 	 * handled according to their default dispositions */
 	sigprocmask(SIG_BLOCK, &ctl.sigset, &ctl.sigorg);
 
-	if ((ctl.sigfd = signalfd(-1, &ctl.sigset, 0)) < 0)
+	if ((ctl.sigfd = signalfd(-1, &ctl.sigset, SFD_CLOEXEC)) < 0)
 		err(EXIT_FAILURE, _("cannot set signal handler"));
 
 	DBG(SIGNAL, ul_debug("signal fd=%d", ctl.sigfd));

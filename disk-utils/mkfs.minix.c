@@ -64,7 +64,6 @@
 #include <stdlib.h>
 #include <termios.h>
 #include <sys/stat.h>
-#include <mntent.h>
 #include <getopt.h>
 #include <err.h>
 
@@ -91,7 +90,7 @@
 #define DEFAULT_FS_VERSION 1
 
 /*
- * Global variables used in minix_programs.h inline fuctions
+ * Global variables used in minix_programs.h inline functions
  */
 int fs_version = DEFAULT_FS_VERSION;
 char *super_block_buffer;
@@ -370,8 +369,7 @@ static void make_root_inode_v1(struct fs_control *ctl) {
 	if (ctl->fs_bad_blocks)
 		inode->i_size = 3 * ctl->fs_dirsize;
 	else {
-		root_block[2 * ctl->fs_dirsize] = '\0';
-		root_block[2 * ctl->fs_dirsize + 1] = '\0';
+		memset(&root_block[2 * ctl->fs_dirsize], 0, ctl->fs_dirsize);
 		inode->i_size = 2 * ctl->fs_dirsize;
 	}
 	inode->i_mode = S_IFDIR + 0755;
@@ -392,7 +390,7 @@ static void make_root_inode_v2_v3 (struct fs_control *ctl) {
 	if (ctl->fs_bad_blocks)
 		inode->i_size = 3 * ctl->fs_dirsize;
 	else {
-		root_block[2 * ctl->fs_dirsize] = '\0';
+		memset(&root_block[2 * ctl->fs_dirsize], 0, ctl->fs_dirsize);
 		inode->i_size = 2 * ctl->fs_dirsize;
 	}
 
@@ -545,7 +543,7 @@ static void setup_tables(const struct fs_control *ctl) {
 		errx(MKFS_EX_ERROR,
 		     _("First data block at %jd, which is too far (max %d).\n"
 		       "Try specifying fewer inodes by passing --inodes <num>"),
-		     first_zone_data(),
+		     (intmax_t)first_zone_data(),
 		     MINIX_MAX_INODES);
 	imaps = get_nimaps();
 	zmaps = get_nzmaps();
@@ -565,14 +563,15 @@ static void setup_tables(const struct fs_control *ctl) {
 
 	printf(P_("%lu inode\n", "%lu inodes\n", inodes), inodes);
 	printf(P_("%lu block\n", "%lu blocks\n", zones), zones);
-	printf(_("Firstdatazone=%jd (%jd)\n"), get_first_zone(), first_zone_data());
+	printf(_("Firstdatazone=%jd (%jd)\n"),
+		(intmax_t)get_first_zone(), (intmax_t)first_zone_data());
 	printf(_("Zonesize=%zu\n"), (size_t) MINIX_BLOCK_SIZE << get_zone_size());
 	printf(_("Maxsize=%zu\n\n"),get_max_size());
 }
 
 /*
  * Perform a test of a block; return the number of
- * blocks readable/writeable.
+ * blocks readable/writable.
  */
 static size_t do_check(const struct fs_control *ctl, char * buffer, int try, unsigned int current_block) {
 	ssize_t got;
@@ -670,15 +669,11 @@ static int find_super_magic(const struct fs_control *ctl)
 	case 1:
 		if (ctl->fs_namelen == 14)
 			return MINIX_SUPER_MAGIC;
-		else
-			return MINIX_SUPER_MAGIC2;
-		break;
+		return MINIX_SUPER_MAGIC2;
 	case 2:
 		if (ctl->fs_namelen == 14)
 			return MINIX2_SUPER_MAGIC;
-		else
-			return MINIX2_SUPER_MAGIC2;
-		break;
+		return MINIX2_SUPER_MAGIC2;
 	case 3:
 		return MINIX3_SUPER_MAGIC;
 	default:
@@ -695,8 +690,6 @@ static void determine_device_blocks(struct fs_control *ctl, const struct stat *s
 
 		if (blkdev_get_sector_size(ctl->device_fd, &sectorsize) == -1)
 			sectorsize = DEFAULT_SECTOR_SIZE;	/* kernel < 2.3.3 */
-		if (blkdev_is_misaligned(ctl->device_fd))
-			warnx(_("%s: device is misaligned"), ctl->device_name);
 		if (MINIX_BLOCK_SIZE < sectorsize)
 			errx(MKFS_EX_ERROR, _("block size smaller than physical "
 					      "sector size of %s"), ctl->device_name);
@@ -770,7 +763,7 @@ int main(int argc, char ** argv)
 		case '1':
 			fs_version = 1;
 			break;
-		case 'v': /* kept for backwards compatiblitly */
+		case 'v': /* kept for backwards compatibility */
 			warnx(_("-v is ambiguous, use '-2' instead"));
 			/* fallthrough */
 		case '2':
@@ -821,10 +814,7 @@ int main(int argc, char ** argv)
 			ctl.device_name);
 	if (stat(ctl.device_name, &statbuf) < 0)
 		err(MKFS_EX_ERROR, _("stat of %s failed"), ctl.device_name);
-	if (S_ISBLK(statbuf.st_mode))
-		ctl.device_fd = open(ctl.device_name, O_RDWR | O_EXCL);
-	else
-		ctl.device_fd = open(ctl.device_name, O_RDWR);
+	ctl.device_fd = open_blkdev_or_file(&statbuf, ctl.device_name, O_RDWR);
 	if (ctl.device_fd < 0)
 		err(MKFS_EX_ERROR, _("cannot open %s"), ctl.device_name);
 	determine_device_blocks(&ctl, &statbuf);

@@ -300,7 +300,7 @@ static int sgi_get_disklabel_item(struct fdisk_context *cxt, struct fdisk_labeli
 		break;
 	default:
 		if (item->id < __FDISK_NLABELITEMS)
-			rc = 1;	/* unssupported generic item */
+			rc = 1;	/* unsupported generic item */
 		else
 			rc = 2;	/* out of range */
 		break;
@@ -592,9 +592,8 @@ static int verify_disklabel(struct fdisk_context *cxt, int verbose)
 		if (sgi_get_num_sectors(cxt, i) != 0) {
 			Index[sortcount++] = i;
 			if (sgi_get_sysid(cxt, i) == SGI_TYPE_ENTIRE_DISK
-			    && entire++ == 1) {
-				if (verbose)
-					fdisk_info(cxt, _("More than one entire "
+			    && entire++ == 1 && verbose) {
+				fdisk_info(cxt, _("More than one entire "
 						"disk entry present."));
 			}
 		}
@@ -968,7 +967,6 @@ static int sgi_create_disklabel(struct fdisk_context *cxt)
 	assert(cxt->label);
 	assert(fdisk_is_label(cxt, SGI));
 
-#ifdef HDIO_GETGEO
 	if (cxt->geom.heads && cxt->geom.sectors) {
 		fdisk_sector_t llsectors;
 
@@ -990,7 +988,7 @@ static int sgi_create_disklabel(struct fdisk_context *cxt)
 				  "> 33.8 GB."), cxt->dev_path, cxt->geom.cylinders);
 		}
 	}
-#endif
+
 	rc = fdisk_init_firstsector_buffer(cxt, 0, 0);
 	if (rc)
 		return rc;

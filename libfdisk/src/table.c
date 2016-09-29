@@ -38,7 +38,7 @@ struct fdisk_table *fdisk_new_table(void)
  * fdisk_reset_table:
  * @tb: tab pointer
  *
- * Removes all entries (partitions) from the table. The parititons with zero
+ * Removes all entries (partitions) from the table. The partitions with zero
  * reference count will be deallocated. This function does not modify partition
  * table.
  *
@@ -65,7 +65,7 @@ int fdisk_reset_table(struct fdisk_table *tb)
  * fdisk_ref_table:
  * @tb: table pointer
  *
- * Incremparts reference counter.
+ * Increments reference counter.
  */
 void fdisk_ref_table(struct fdisk_table *tb)
 {
@@ -77,7 +77,7 @@ void fdisk_ref_table(struct fdisk_table *tb)
  * fdisk_unref_table:
  * @tb: table pointer
  *
- * De-incremparts reference counter, on zero the @tb is automatically
+ * Descrements reference counter, on zero the @tb is automatically
  * deallocated.
  */
 void fdisk_unref_table(struct fdisk_table *tb)
@@ -394,6 +394,8 @@ static int new_freespace(struct fdisk_context *cxt,
 			 struct fdisk_partition *parent,
 			 struct fdisk_partition **pa)
 {
+	fdisk_sector_t aligned_start, size;
+
 	assert(cxt);
 	assert(pa);
 
@@ -401,17 +403,26 @@ static int new_freespace(struct fdisk_context *cxt,
 
 	if (start == end)
 		return 0;
-	*pa = fdisk_new_partition();
-	if (!*pa)
-		return -ENOMEM;
 
 	assert(start);
 	assert(end);
 	assert(end > start);
 
+	aligned_start = fdisk_align_lba_in_range(cxt, start, start, end);
+	size = end - aligned_start + 1ULL;
+
+	if (size == 0) {
+		DBG(TAB, ul_debug("ignore freespace (aligned size is zero)"));
+		return 0;
+	}
+
+	*pa = fdisk_new_partition();
+	if (!*pa)
+		return -ENOMEM;
+
 	(*pa)->freespace = 1;
-	(*pa)->start = fdisk_align_lba_in_range(cxt, start, start, end);
-	(*pa)->size = end - (*pa)->start + 1ULL;
+	(*pa)->start = aligned_start;
+	(*pa)->size = size;
 
 	if (parent)
 		(*pa)->parent_partno = parent->partno;
@@ -508,11 +519,13 @@ static int check_container_freespace(struct fdisk_context *cxt,
 	grain = cxt->grain > cxt->sector_size ?	cxt->grain / cxt->sector_size : 1;
 	fdisk_reset_iter(&itr, FDISK_ITER_FORWARD);
 
-	DBG(CXT, ul_debugobj(cxt, "initialized:  last=%ju, grain=%ju", last, grain));
+	DBG(CXT, ul_debugobj(cxt, "initialized:  last=%ju, grain=%ju",
+	                     (uintmax_t)last,  (uintmax_t)grain));
 
 	while (fdisk_table_next_partition(parts, &itr, &pa) == 0) {
 
-		DBG(CXT, ul_debugobj(cxt, "partno=%zu, start=%ju", pa->partno, pa->start));
+		DBG(CXT, ul_debugobj(cxt, "partno=%zu, start=%ju",
+		                     pa->partno, (uintmax_t)pa->start));
 
 		if (!pa->used || !fdisk_partition_is_nested(pa)
 			      || !fdisk_partition_has_start(pa))
@@ -583,12 +596,14 @@ int fdisk_get_freespaces(struct fdisk_context *cxt, struct fdisk_table **tb)
 	last = cxt->first_lba;
 	grain = cxt->grain > cxt->sector_size ?	cxt->grain / cxt->sector_size : 1;
 
-	DBG(CXT, ul_debugobj(cxt, "initialized:  last=%ju, grain=%ju", last, grain));
+	DBG(CXT, ul_debugobj(cxt, "initialized:  last=%ju, grain=%ju",
+	                     (uintmax_t)last,  (uintmax_t)grain));
 
 	/* analyze gaps between partitions */
 	while (rc == 0 && fdisk_table_next_partition(parts, &itr, &pa) == 0) {
 
-		DBG(CXT, ul_debugobj(cxt, "partno=%zu, start=%ju", pa->partno, pa->start));
+		DBG(CXT, ul_debugobj(cxt, "partno=%zu, start=%ju",
+		                     pa->partno, (uintmax_t)pa->start));
 
 		if (!pa->used || pa->wholedisk || fdisk_partition_is_nested(pa)
 			      || !fdisk_partition_has_start(pa))
@@ -597,9 +612,14 @@ int fdisk_get_freespaces(struct fdisk_context *cxt, struct fdisk_table **tb)
 					pa->partno,
 					(uintmax_t) fdisk_partition_get_start(pa),
 					(uintmax_t) fdisk_partition_get_end(pa)));
-		if (last + grain <= pa->start) {
+
+		/* We ignore small free spaces (smaller than grain) to keep partitions
+		 * aligned, the exception is space before the first partition where
+		 * we assume that cxt->first_lba is aligned. */
+		if (last + grain < pa->start
+		    || (last < pa->start && nparts == 0)) {
 			rc = table_add_freespace(cxt, *tb,
-				last + (last > cxt->first_lba ? 1 : 0),
+				last + (nparts == 0 ? 0 : 1),
 				pa->start - 1, NULL);
 		}
 		/* add gaps between logical partitions */
@@ -662,7 +682,7 @@ int fdisk_table_wrong_order(struct fdisk_table *tb)
  * Add partitions from table @tb to the in-memory disk label. See
  * fdisk_add_partition(), fdisk_delete_all_partitions(). The partitions
  * that does not define start (or does not follow the default start)
- * are ingored.
+ * are ignored.
  *
  * Returns: 0 on success, <0 on error.
  */

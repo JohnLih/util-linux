@@ -31,8 +31,8 @@ endif
 
 check_PROGRAMS += test_consoles
 test_consoles_SOURCES = login-utils/sulogin-consoles.c
-test_consoles_CFLAGS = -DTEST_PROGRAM
-test_consoles_LDADD = libcommon.la
+test_consoles_CFLAGS = $(AM_CFLAGS) -DTEST_PROGRAM
+test_consoles_LDADD = $(LDADD) libcommon.la
 endif # BUILD_SULOGIN
 
 
@@ -67,6 +67,7 @@ if BUILD_UTMPDUMP
 usrbin_exec_PROGRAMS += utmpdump
 dist_man_MANS += login-utils/utmpdump.1
 utmpdump_SOURCES = login-utils/utmpdump.c
+utmpdump_LDADD = $(LDADD) libcommon.la
 endif
 
 
